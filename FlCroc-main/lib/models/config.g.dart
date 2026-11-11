@@ -1,0 +1,102 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'config.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+_AppSettingProps _$AppSettingPropsFromJson(Map<String, dynamic> json) =>
+    _AppSettingProps(
+      locale: json['locale'] as String?,
+      dashboardWidgets: json['dashboardWidgets'] == null
+          ? defaultDashboardWidgets
+          : const DashboardWidgetListConverter().fromJson(
+              json['dashboardWidgets'] as List,
+            ),
+      autoLaunch: json['autoLaunch'] as bool? ?? false,
+      silentLaunch: json['silentLaunch'] as bool? ?? false,
+      minimizeOnExit: json['minimizeOnExit'] as bool? ?? false,
+      themeMode:
+          $enumDecodeNullable(_$ThemeModeOptionEnumMap, json['themeMode']) ??
+          ThemeModeOption.system,
+      colorSchemeType:
+          $enumDecodeNullable(
+            _$ColorSchemeTypeEnumMap,
+            json['colorSchemeType'],
+          ) ??
+          ColorSchemeType.fidelity,
+      fontFamily:
+          $enumDecodeNullable(_$FontFamilyEnumMap, json['fontFamily']) ??
+          FontFamily.system,
+      pureBlackMode: json['pureBlackMode'] as bool? ?? false,
+      noTextMode: json['noTextMode'] as bool? ?? false,
+      disableAnimations: json['disableAnimations'] as bool? ?? false,
+      developerMode: json['developerMode'] as bool? ?? false,
+      autoCheckUpdate: json['autoCheckUpdate'] as bool? ?? false,
+      updateChannel:
+          $enumDecodeNullable(_$UpdateChannelEnumMap, json['updateChannel']) ??
+          UpdateChannel.release,
+      relayConfig: json['relayConfig'] == null
+          ? const RelayConfig()
+          : RelayConfig.fromJson(json['relayConfig'] as Map<String, dynamic>),
+      defaultSavePath: json['defaultSavePath'] as String? ?? '',
+    );
+
+Map<String, dynamic> _$AppSettingPropsToJson(_AppSettingProps instance) =>
+    <String, dynamic>{
+      'locale': instance.locale,
+      'dashboardWidgets': const DashboardWidgetListConverter().toJson(
+        instance.dashboardWidgets,
+      ),
+      'autoLaunch': instance.autoLaunch,
+      'silentLaunch': instance.silentLaunch,
+      'minimizeOnExit': instance.minimizeOnExit,
+      'themeMode': _$ThemeModeOptionEnumMap[instance.themeMode]!,
+      'colorSchemeType': _$ColorSchemeTypeEnumMap[instance.colorSchemeType]!,
+      'fontFamily': _$FontFamilyEnumMap[instance.fontFamily]!,
+      'pureBlackMode': instance.pureBlackMode,
+      'noTextMode': instance.noTextMode,
+      'disableAnimations': instance.disableAnimations,
+      'developerMode': instance.developerMode,
+      'autoCheckUpdate': instance.autoCheckUpdate,
+      'updateChannel': _$UpdateChannelEnumMap[instance.updateChannel]!,
+      'relayConfig': instance.relayConfig,
+      'defaultSavePath': instance.defaultSavePath,
+    };
+
+const _$ThemeModeOptionEnumMap = {
+  ThemeModeOption.system: 'system',
+  ThemeModeOption.light: 'light',
+  ThemeModeOption.dark: 'dark',
+};
+
+const _$ColorSchemeTypeEnumMap = {
+  ColorSchemeType.fidelity: 'fidelity',
+  ColorSchemeType.expressive: 'expressive',
+  ColorSchemeType.rainbow: 'rainbow',
+  ColorSchemeType.fruitSalad: 'fruitSalad',
+  ColorSchemeType.monochrome: 'monochrome',
+};
+
+const _$FontFamilyEnumMap = {
+  FontFamily.system: 'system',
+  FontFamily.notoSans: 'notoSans',
+  FontFamily.roboto: 'roboto',
+};
+
+const _$UpdateChannelEnumMap = {
+  UpdateChannel.release: 'release',
+  UpdateChannel.nightly: 'nightly',
+};
+
+_ThemeProps _$ThemePropsFromJson(Map<String, dynamic> json) => _ThemeProps(
+  primaryColor: (json['primaryColor'] as num?)?.toInt() ?? defaultPrimaryColor,
+  useDynamicColor: json['useDynamicColor'] as bool? ?? false,
+);
+
+Map<String, dynamic> _$ThemePropsToJson(_ThemeProps instance) =>
+    <String, dynamic>{
+      'primaryColor': instance.primaryColor,
+      'useDynamicColor': instance.useDynamicColor,
+    };

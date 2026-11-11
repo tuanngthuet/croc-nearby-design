@@ -1,0 +1,166 @@
+# ============================================================
+# Flutter / Dart 构建产物
+# ============================================================
+.dart_tool/
+.packages
+.packages.generated
+.pub/
+.pub-preload-cache/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter_tool_state
+# flutter 工具偶尔在工程根落下的 0 字节标记文件
+/.flutter
+**/generated_plugin_registrant.dart
+
+# ============================================================
+# IDE / 编辑器
+# ============================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ============================================================
+# AI agent reference (local only, not committed)
+# ============================================================
+AGENTS.md
+.workbuddy/
+
+# ============================================================
+# 操作系统杂项
+# ============================================================
+.DS_Store
+Thumbs.db
+*.class
+*.lock
+*.log
+*.pyc
+.buildlog/
+.history
+
+# ============================================================
+# Android
+# ============================================================
+.gradle/
+*.jks
+*.keystore
+**/android/captures/
+**/android/key.properties
+*.jks
+**/android/local.properties
+**/android/**/gradle-wrapper.jar
+**/android/**/GeneratedPluginRegistrant.java
+
+# ============================================================
+# iOS / Xcode
+# ============================================================
+**/ios/**/*.mode1v3
+**/ios/**/*.mode2v3
+**/ios/**/*.moved-aside
+**/ios/**/*.pbxuser
+**/ios/**/*.perspectivev3
+**/ios/**/*sync/
+**/ios/**/.sconsign.dblite
+**/ios/**/.tags*
+**/ios/**/.vagrant/
+**/ios/**/DerivedData/
+**/ios/**/Icon?
+**/ios/**/Pods/
+**/ios/**/.symlinks/
+**/ios/**/profile
+**/ios/**/xcuserdata
+**/ios/.generated/
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/App.framework
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/ephemeral
+**/ios/Flutter/app.flx
+**/ios/Flutter/app.zip
+**/ios/Flutter/flutter_assets/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/ServiceDefinitions.json
+**/ios/Runner/GeneratedPluginRegistrant.*
+
+# ============================================================
+# macOS
+# ============================================================
+**/Flutter/ephemeral/
+**/Pods/
+**/xcuserdata/
+**/macos/Flutter/GeneratedPluginRegistrant.swift
+**/macos/Flutter/ephemeral
+
+# ============================================================
+# Windows
+# ============================================================
+**/windows/flutter/generated_plugin_registrant.cc
+**/windows/flutter/generated_plugin_registrant.h
+**/windows/flutter/generated_plugins.cmake
+
+# ============================================================
+# Linux
+# ============================================================
+**/linux/flutter/generated_plugin_registrant.cc
+**/linux/flutter/generated_plugin_registrant.h
+**/linux/flutter/generated_plugins.cmake
+
+# ============================================================
+# Web
+# ============================================================
+
+# ============================================================
+# 覆盖率 / 符号
+# ============================================================
+coverage/
+app.*.symbols
+
+# ============================================================
+# 自动生成的启动图标（从 assets/images/icon.png 生成）
+# ============================================================
+**/android/**/mipmap-*/ic_launcher.png
+**/ios/**/AppIcon.appiconset/Icon-*.png
+**/macos/**/AppIcon.appiconset/app_icon_*.png
+web/favicon.png
+web/icons/
+**/windows/runner/resources/app_icon.ico
+**/linux/runner/resources/icon.png
+
+# ============================================================
+# Go / FFI 跨语言桥接（构建产物）
+# ============================================================
+**/libcroc_bridge.dll
+**/libcroc_bridge.so
+**/libcroc_bridge.dylib
+**/libcroc_bridge.h
+go_bridge/flcroc_bridge.dll
+go_bridge/flcroc_bridge.h
+
+# ============================================================
+# CI / Workflow（历史遗留的单平台 workflow 文件，勿提交）
+# ============================================================
+.github/workflows/build-android.yml
+.github/workflows/build-linux.yml
+.github/workflows/build-windows.yml
+
+# ============================================================
+# 项目特定
+# ============================================================
+submodules/croc/.github
+/go_bridge/test_send
+
+# AI 助手工作区数据（本地记忆 / 会话状态，不入库）
+/.workbuddy-ai/
+
+# ============================================================
+# iOS / Xcode 例外：保留默认模式文件
+# ============================================================
+!**/ios/**/default.mode1v3
+!**/ios/**/default.mode2v3
+!**/ios/**/default.pbxuser
+!**/ios/**/default.perspectivev3
+
+android/key.properties.example

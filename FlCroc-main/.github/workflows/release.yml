@@ -1,0 +1,558 @@
+name: Release
+
+# 唯一入口 —— push / pull_request / workflow_dispatch 都由本文件承接，编译打包、
+# 质量门禁、i18n 与文档回写分别委托给 build.yml / lint.yml / update_i18n.yml 三个
+# 可复用工作流。
+#
+#   push main                 → **自动出包**（默认三目标）+ 发 nightly 预发布（tag `r<1000+提交数>`）
+#   push 其它分支             → 只做维护：跑测试 + 按需重新生成 i18n/文档并提交回分支
+#   pull_request              → 跑测试 + 重新渲染 i18n/文档（不提交、不出包）
+#   workflow_dispatch         → 手动勾选目标出包；channel 决定 nightly / release / 仅出产物
+#
+# 路径过滤只挂在 push 上（见 on.push.paths-ignore）：纯文档改动的 push 整个 workflow
+# 都不跑，也就不出包。三条容易踩的：
+#   * 是「**全部**变更路径都命中」才跳过 —— 文档与代码混在同一个 push 里照常出包；
+#   * 跳过时**一个 run 都不建**，Actions 页面看不到任何记录、哪里都不报错。这和提交
+#     信息里写 [skip ci] 是同一类静默行为 —— 排查「我推了怎么没跑」先想这两处；
+#   * 需要强制出包时用 workflow_dispatch，路径过滤对手动触发不生效。
+#
+# "默认三目标" = dispatch 的默认勾选，两处默认值必须一起改：
+#   Windows x64 / Linux x64 / Android ARM64（见 Resolve targets & version 步骤）。
+# 不让 push 用 release 通道：release 的 tag 是 `v<x.y.z>`（不含 build 号），
+# 同版本第二次 push 会撞上已存在的 tag。
+#
+# nightly 通道的 tag 一律是 `r<1000+提交数>`（HEAD 可达提交数 + 1000），不再覆盖式地
+# 复用一个固定 tag：每次发布各留一条独立、互不覆盖的记录，便于回溯「这次发布对应
+# 哪个 commit」。代价是预发布只增不减 —— 由 clear.yml 定期清理。
+# 应用内的 nightly 更新通道改成「取最新的预发布」（lib/application.dart 与
+# lib/views/settings/settings.dart），不再认固定 tag，所以以后再改 tag 规则也不用动
+# app。
+#
+# 两种 nightly 都是预发布，因此都不会成为 release 页的 Latest —— GitHub 明确
+# 「Latest release cannot be draft or prerelease.」；实测 PATCH 直接 422、POST
+# 创建则静默忽略（HTTP 200 但不生效）。Latest 只由 channel=release 更新。
+#
+# dispatch 的选项（见文件末尾 on.workflow_dispatch.inputs）：
+#
+#   7 个平台开关，产物名统一 FlCroc-<x.y.z>-<os>-<arch>.<ext>，架构一律写 x64 /
+#   arm64（amd64 只出现在 go build 的 GOARCH 参数里，不进产物名）：
+#     Windows x64 / Windows arm64 / Linux x64 / Linux arm64
+#     Android arm64 / Android x64 / macOS arm64（macOS 只有 arm64 一个目标）
+#
+#   两个非架构开关：release_notes（发行说明，**追加在自动生成正文的最上方**，不覆盖
+#   Commit / 下载表）、force_docs（强制重新生成 i18n 与 README）。
+#
+# 表单里每项的标签就是它的 description（缺失才退回显示输入 id）。GitHub 的
+# workflow_dispatch 也只认 description / required / default / type / options ——
+# 没有分组或标题语法，所以表单是一列平铺的字段。
+#
+# 与原 build.yml 的差别：
+#   * 提交信息文本触发器（b-all / b-win / b-linux / b-mobile / b-none / arch-all /
+#     b-doc / r-x.y.z）全部移除，目标与通道改由 dispatch 选项承担；
+#   * 不再有 push tag 触发 —— tag 由本文件的 publish job 依 channel 自行创建；
+#   * 「Build」拆到 build.yml（on: workflow_call），i18n 与文档的生成、回写拆到
+#     update_i18n.yml；本文件只负责算参数、串依赖与发布。
+#
+# 版本号仍以 pubspec.yaml 的 x.y.z+N 为唯一事实来源，但**递增发生在本地**：
+# .githooks/pre-commit 每次提交把 N 加 1，所以本工作流只读不写、不再回写分支。
+# 这里只负责把 pubspec 里的值取出来交给 build.yml。dispatch **没有**覆盖版本的
+# 入口（曾经的 version 输入已移除）：要换版本就改 pubspec.yaml 再提交。
+#
+# action 版本都已升到当前最新大版本（与 build.yml 同一批，Node 24 运行时）。
+# 只有本文件用到的两个需要留意的破坏性变更：
+#   download-artifact v8 —— ① 不再无条件解压：按 Content-Type 判断，非 zip 的不解压
+#                            （我们上传的都是 zip 容器，仍会正常解出原始文件）；
+#                          ② 摘要不匹配从 warn 改为**默认 error**（secure by default），
+#                             想回退用 digest-mismatch 参数。
+#                           另外 v5 的破坏性变更只针对「按 ID 下载单个制品」的路径
+#                           行为，我们全部按 name 下载，不受影响。
+#   action-gh-release v3 —— 仅 Node 20 → Node 24 运行时，输入参数未变。
+
+on:
+  push:
+    branches: [main, dev]
+    # 纯文档改动不出包。官方语义：**全部**变更路径都命中下面任一条 → 整个 workflow
+    # 不运行（连 run 都不建，Actions 页面不留痕迹）；只要有一条不命中，照常运行。
+    #
+    # 刻意**不**列 assets/**：assets/docs/ 与 assets/templates/ 是 update_i18n 的输入
+    # （指纹由 git subtree id 算出），改了就得重渲染 README 与 docs/i18n.md，
+    # 滤掉它们等于让那两处永久失修。同理不列 .gitattributes —— 它会影响检出后的字节。
+    #
+    # pull_request 有意不加同样的过滤：PR 本来就不出包，但会照常重新渲染一遍
+    # docs/i18n.md 与各语言 README（渲染脚本报错就红），把 docs/** 滤掉等于白丢这道
+    # 渲染检查。
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'                  # 只匹配根目录（* 不跨 /），assets/templates/*.md 不受影响
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 发布通道
+        type: choice
+        options: [nightly, release, none]
+        default: nightly
+      windows_x64:
+        description: Windows x64
+        type: boolean
+        default: true
+      windows_arm64:
+        description: Windows arm64
+        type: boolean
+        default: false
+      linux_x64:
+        description: Linux x64
+        type: boolean
+        default: true
+      linux_arm64:
+        description: Linux arm64
+        type: boolean
+        default: false
+      android_arm64:
+        description: Android arm64
+        type: boolean
+        default: true
+      android_x64:
+        description: Android x64
+        type: boolean
+        default: false
+      # macOS 只有 arm64 一个目标：Flutter 已停止支持 Intel macOS，其 release
+      # manifest 也不再发布 x64 归档。
+      macos_arm64:
+        description: macOS arm64
+        type: boolean
+        default: false
+      # 内容**追加在自动生成正文的最上方**，不是替换 —— Commit / 下载表照常保留。
+      release_notes:
+        description: 发行说明（追加在正文最上方，不覆盖自动生成的内容）
+        type: string
+        default: ''
+      force_docs:
+        description: 强制重新生成 i18n 与 README
+        type: boolean
+        default: false
+
+# 编译用的 SDK 版本在这里钉死。本文件只用到 FLUTTER_VERSION —— 它既是 README 徽章
+# 与「技术栈」表格里印出来的版本，也是 build.yml 真正拿去编译的那个版本；两处各自
+# 有一份同名 env，改一处必须同步改另一处。
+env:
+  FLUTTER_VERSION: '3.47.5'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Prep: 平台/版本/通道/i18n 变化探测 ──
+  prep:
+    name: 准备发布参数
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      channel: ${{ steps.ver.outputs.channel }}
+      version: ${{ steps.ver.outputs.version }}
+      display_version: ${{ steps.ver.outputs.display_version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+      has_targets: ${{ steps.ver.outputs.has_targets }}
+      nightly_date: ${{ steps.ver.outputs.nightly_date }}
+      win_x64: ${{ steps.ver.outputs.win_x64 }}
+      win_arm64: ${{ steps.ver.outputs.win_arm64 }}
+      linux_x64: ${{ steps.ver.outputs.linux_x64 }}
+      linux_arm64: ${{ steps.ver.outputs.linux_arm64 }}
+      android_arm64: ${{ steps.ver.outputs.android_arm64 }}
+      android_x64: ${{ steps.ver.outputs.android_x64 }}
+      macos_arm64: ${{ steps.ver.outputs.macos_arm64 }}
+      app_version: ${{ steps.app-ver.outputs.version }}
+      flutter_version: ${{ steps.flutter-ver.outputs.version }}
+      croc_version: ${{ steps.croc-ver.outputs.version }}
+      i18n_do: ${{ steps.hash-check.outputs.do_i18n }}
+      docs_do: ${{ steps.hash-check.outputs.do_docs }}
+      bundles_hash: ${{ steps.hash-check.outputs.bundles_hash }}
+      docs_hash: ${{ steps.hash-check.outputs.docs_hash }}
+      templates_hash: ${{ steps.hash-check.outputs.templates_hash }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Detect croc version
+        id: croc-ver
+        run: |
+          cd submodules/croc
+          VER=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+          # submodule 固定版本是唯一事实来源；若 checkout 没带 tag，回退到 croc
+          # 自己的版本文件 —— 与 Go 桥报告的 version.Value 同一个值。
+          if [ -z "$VER" ]; then
+            VER=$(sed -n 's/.*Value = "\(.*\)"/\1/p' src/version/version.go 2>/dev/null | head -1)
+          fi
+          echo "version=${VER:-unknown}" >> $GITHUB_OUTPUT
+          cd ../..
+
+      - name: Detect Flutter version
+        id: flutter-ver
+        run: |
+          VER=$(curl -sL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json | jq -r '.releases[] | select(.channel=="stable") | .version' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "version=${VER:-unknown}" >> $GITHUB_OUTPUT
+
+      - name: Detect app version
+        id: app-ver
+        run: |
+          VER=$(grep '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+
+      - name: Resolve targets & version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          # push 事件要不要自动出包，取决于是不是 main（见下方 Resolve 步骤）
+          REF_NAME: ${{ github.ref_name }}
+          IN_CHANNEL: ${{ github.event.inputs.channel }}
+          IN_FORCE_DOCS: ${{ github.event.inputs.force_docs }}
+          IN_WIN64: ${{ github.event.inputs.windows_x64 }}
+          IN_WIN_A64: ${{ github.event.inputs.windows_arm64 }}
+          IN_LINUX64: ${{ github.event.inputs.linux_x64 }}
+          IN_LINUX_A64: ${{ github.event.inputs.linux_arm64 }}
+          IN_A64: ${{ github.event.inputs.android_arm64 }}
+          IN_AX64: ${{ github.event.inputs.android_x64 }}
+          IN_MACOS_A64: ${{ github.event.inputs.macos_arm64 }}
+        run: |
+          set -euo pipefail
+
+          # 默认不出包：pull_request 只做维护（可能来自 fork，拿不到 secrets，
+          # 也不该发布），非 main 分支的 push 同理。
+          CHANNEL='none'; FORCE_DOCS='false'
+          W64='false'; WA64='false'; L64='false'; LA64='false'; A64='false'; AX64='false'
+          MA64='false'
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            CHANNEL="${IN_CHANNEL:-none}"
+            # input 没填时 github.event.inputs.X 渲染成空串（而不是 'false'），统一兜 false
+            FORCE_DOCS="${IN_FORCE_DOCS:-false}"
+            W64="${IN_WIN64:-false}"
+            WA64="${IN_WIN_A64:-false}"
+            L64="${IN_LINUX64:-false}"
+            LA64="${IN_LINUX_A64:-false}"
+            A64="${IN_A64:-false}"
+            AX64="${IN_AX64:-false}"
+            MA64="${IN_MACOS_A64:-false}"
+          elif [ "$EVENT" = "push" ] && [ "$REF_NAME" = "main" ]; then
+            # ── push main：自动出包并更新 nightly 预发布 ──
+            # 目标与 dispatch 的默认勾选**完全一致**（Windows x64 / Linux x64 /
+            # Android ARM64），所以「手动 dispatch 什么都不改」与「push 一次」
+            # 产出同一组产物 —— 两处默认值要一起改，别只改一边。
+            #
+            # 只认 main：两个分支的提交数可能相同，r<1000+提交数> 会撞号。
+            # 不会自我触发循环：update_i18n.yml 的回写提交固定以 `[skip ci]` 结尾
+            # （见那里的 Commit and push 步骤），i18n/文档回写那一次 push 不会再拉起
+            # 本工作流。
+            # 也不用 release 通道做自动发布：release 的 tag 是 `v<x.y.z>`（不含 build
+            # 号），同版本第二次 push 会撞上已存在的 tag，只能 nightly。
+            CHANNEL='nightly'
+            W64='true'; L64='true'; A64='true'
+          fi
+
+          # Windows ARM64 包在 x64 包基础上换 .dll 重打，所以 build.yml 的 windows job
+          # 在「只要 arm64」时也会跑一遍 x64 构建当作基底 —— 但那只是 job 内部的中间
+          # 产物，x64 的 upload-artifact 仍只看 windows_x64，不勾就不上传，于是发布
+          # 正文与附件里都不会出现 windows-x64。这里**不**再把 W64 置 true：
+          # 一旦置 true，x64 包就会被当成用户主动选择的目标发出去。
+          HAS_TARGETS='false'
+          for f in "$W64" "$WA64" "$L64" "$LA64" "$A64" "$AX64" "$MA64"; do
+            if [ "$f" = "true" ]; then HAS_TARGETS='true'; fi
+          done
+
+          # 版本号：pubspec 的 x.y.z+N 是唯一事实来源，且**由本地 pre-commit 钩子
+          # 递增**（.githooks/pre-commit）。CI 刻意不再递增、也不再回写分支 ——
+          # 出包时用的就是提交里那个号，产物与 commit 一一对应，不需要再靠
+          # [skip ci] 去规避「回写触发新一轮构建」。
+          # dispatch 也没有覆盖入口（曾经的 version 输入已移除）：要换版本就改
+          # pubspec.yaml 再提交，让本地钩子把 build 号带上去。
+          FULL=$(grep '^version:' pubspec.yaml | head -1 | awk '{print $2}')
+          [ -n "$FULL" ] || { echo "::error::pubspec.yaml 里读不到 version:"; exit 1; }
+          echo "版本取自 pubspec：$FULL"
+          DISPLAY="${FULL%%+*}"
+
+          # 通道 → tag / 预发布标志。
+          #   nightly → `r<1000+提交数>`，push 与 dispatch 一视同仁。应用内的 nightly
+          #     更新通道取最新的预发布，不认固定 tag（见 lib/application.dart）。
+          #   release → `v<x.y.z>`（不含 build 号）。
+          case "$CHANNEL" in
+            nightly)
+              PRE='true'
+              # 提交数 = HEAD 可达的祖先数（含自身）。依赖 prep 的 fetch-depth: 0：
+              # 浅克隆下 rev-list --count 会静默偏小甚至恒为 1，算出来的 tag 会
+              # 悄悄撞到别的构建上，故先挡住。
+              if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+                echo "::error::仓库是浅克隆，git rev-list --count 不可信，无法推算 r<1000+提交数>"
+                exit 1
+              fi
+              RCOUNT=$(git rev-list --count HEAD)
+              TAG="r$((1000 + RCOUNT))"
+              echo "nightly 通道打 r<1000+提交数> 标签 → $TAG"
+              ;;
+            release) TAG="v${DISPLAY}";     PRE='false' ;;
+            none)    TAG='';                PRE='false' ;;
+            *) echo "::error::未知 channel: $CHANNEL"; exit 1 ;;
+          esac
+          if [ "$CHANNEL" != "none" ] && [ "$HAS_TARGETS" != "true" ]; then
+            echo "::error::channel=$CHANNEL 但没勾选任何构建目标，没有产物可发布"
+            exit 1
+          fi
+
+          {
+            echo "channel=$CHANNEL"
+            echo "version=$FULL"
+            echo "display_version=$DISPLAY"
+            echo "tag=$TAG"
+            echo "prerelease=$PRE"
+            echo "has_targets=$HAS_TARGETS"
+            echo "win_x64=$W64"
+            echo "win_arm64=$WA64"
+            echo "linux_x64=$L64"
+            echo "linux_arm64=$LA64"
+            echo "android_arm64=$A64"
+            echo "android_x64=$AX64"
+            echo "macos_arm64=$MA64"
+            echo "force_docs=$FORCE_DOCS"
+            echo "nightly_date=$(date +%Y%m%d)"
+          } >> $GITHUB_OUTPUT
+          echo "目标 → win64:$W64 win-arm64:$WA64 linux64:$L64 linux-arm64:$LA64 android-arm64:$A64 android-x64:$AX64 macos-arm64:$MA64  channel:$CHANNEL"
+          echo "标签 → ${TAG:-（不发布）} prerelease:$PRE"
+
+      - name: Check i18n & docs changes
+        id: hash-check
+        env:
+          FORCE: ${{ steps.ver.outputs.force_docs }}
+        run: |
+          # 三组 i18n 输入的内容指纹（短 hash，前 8 位）。
+          # 用 git 的 subtree 对象 ID，而不是 `find | sha256sum`：
+          # 后者的被哈希流里混进了**文件路径**（sha256sum 会把路径打进输出），
+          # 于是同一份内容在不同 checkout 前缀 / 行尾（autocrlf）/ locale 下会算出
+          # 不同结果。那正是"已记录 hash"永远对不上的根源之一：CI 写进 docs/i18n.md
+          # 的值在本地无法复核（实测：全仓库 249 个提交 × LF/CRLF 两种行尾 × 多种
+          # 枚举形式，都复现不出已记录的值，连同一个提交的树上都算不出来）。
+          # subtree ID 是该子树 (mode, name, blob-sha) 的 Merkle 摘要 —— 只依赖仓库
+          # 对象，与路径前缀、行尾、locale 无关，在 runner 与本地完全一致。
+          tree_id() { git rev-parse "HEAD:$1"; }
+          BUNDLES_HASH=$(tree_id assets/bundles | cut -c1-8)
+          DOCS_HASH=$(tree_id assets/docs | cut -c1-8)
+          TEMPLATES_HASH=$(printf '%s\n%s\n' "$(tree_id assets/templates)" \
+                                            "$(tree_id assets/.i18n_config)" | sha256sum | cut -c1-8)
+
+          # force_docs: 强制重新生成 i18n + 文档（取代旧的 b-doc 文本触发器）
+          if [ "$FORCE" = "true" ]; then
+            echo "do_i18n=true" >> $GITHUB_OUTPUT
+            echo "do_docs=true" >> $GITHUB_OUTPUT
+            echo "bundles_hash=$BUNDLES_HASH" >> $GITHUB_OUTPUT
+            echo "docs_hash=$DOCS_HASH" >> $GITHUB_OUTPUT
+            echo "templates_hash=$TEMPLATES_HASH" >> $GITHUB_OUTPUT
+            echo "i18n: true (forced)  docs: true (forced)"
+            exit 0
+          fi
+
+          # docs/i18n.md 里的形态是 `> bundles:   640c32fe  `（行首 "> "、行尾两个空格，
+          # checkout 后还可能带 CR）。**不能用 `awk '{print $2}'`** —— 那样取到的是
+          # "bundles:" 这个单词本身，永远不等于真实 hash，于是 do_i18n/do_docs 恒为 true，
+          # 每次 push 都重新生成 i18n 与全部 README 并留下一次机器人提交（旧 CI 就是这个
+          # 行为）。这里按行首 "> <key>:" 精确取值，并去掉可能存在的 CR。
+          read_hash() {
+            sed -n "s/^> *$1: *\([0-9a-f]\{4,\}\).*/\1/p" docs/i18n.md | tail -1 | tr -d '\r'
+          }
+          OLD_BUNDLES=""; OLD_DOCS=""; OLD_TEMPLATES=""
+          if [ -f docs/i18n.md ]; then
+            OLD_BUNDLES=$(read_hash bundles)
+            OLD_DOCS=$(read_hash docs)
+            OLD_TEMPLATES=$(read_hash templates)
+          fi
+          echo "已记录的 hash → bundles:${OLD_BUNDLES:-无} docs:${OLD_DOCS:-无} templates:${OLD_TEMPLATES:-无}"
+
+          DO_I18N="false"; DO_DOCS="false"
+          # Templates change → force like force_docs
+          [ "$TEMPLATES_HASH" != "$OLD_TEMPLATES" ] && DO_I18N="true" && DO_DOCS="true"
+          [ "$BUNDLES_HASH" != "$OLD_BUNDLES" ] && DO_I18N="true"
+          [ "$DOCS_HASH" != "$OLD_DOCS" ] && DO_I18N="true"
+          [ "$DOCS_HASH" != "$OLD_DOCS" ] && DO_DOCS="true"
+
+          echo "do_i18n=$DO_I18N" >> $GITHUB_OUTPUT
+          echo "do_docs=$DO_DOCS" >> $GITHUB_OUTPUT
+          echo "bundles_hash=$BUNDLES_HASH" >> $GITHUB_OUTPUT
+          echo "docs_hash=$DOCS_HASH" >> $GITHUB_OUTPUT
+          echo "templates_hash=$TEMPLATES_HASH" >> $GITHUB_OUTPUT
+          echo "i18n: $DO_I18N  docs: $DO_DOCS"
+
+  # ── 质量门禁（复用 lint.yml） ──
+  # PR 上不调：pr.yml 已经调过一遍，重复跑没意义。
+  lint:
+    name: 质量门禁
+    needs: prep
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/lint.yml
+
+  # ── i18n / 文档（复用 update_i18n.yml） ──
+  # needs 只挂 prep，本 job 也不做条件跳过：build 的 needs 里有它，而 needs 中只要有
+  # skipped 的 job，下游就会连带被跳过 —— 无论按 i18n_do / docs_do 在这里跳过，还是
+  # 让它 needs 一个在 PR 上会被跳过的 job（lint），都会把「这次没有文档改动」变成
+  # 「这次不出包」。要不要重新生成由 prep 的输出决定，判断在 update_i18n.yml 内部。
+  #
+  # permissions 必须在这里给：可复用 workflow 自身不能提升调用方授予的权限。
+  update_i18n:
+    name: i18n / 文档
+    needs: prep
+    permissions:
+      contents: write
+    uses: ./.github/workflows/update_i18n.yml
+    with:
+      i18n_do: ${{ needs.prep.outputs.i18n_do }}
+      docs_do: ${{ needs.prep.outputs.docs_do }}
+      bundles_hash: ${{ needs.prep.outputs.bundles_hash }}
+      docs_hash: ${{ needs.prep.outputs.docs_hash }}
+      templates_hash: ${{ needs.prep.outputs.templates_hash }}
+      app_version: ${{ needs.prep.outputs.app_version }}
+      flutter_version: ${{ needs.prep.outputs.flutter_version }}
+      croc_version: ${{ needs.prep.outputs.croc_version }}
+
+  # ── Build（委托可复用工作流） ──
+  build:
+    name: 构建
+    # update_i18n 一定会执行（见上），所以它不会把本 job 连带跳过。
+    needs: [prep, update_i18n, lint]
+    if: needs.prep.outputs.has_targets == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.prep.outputs.version }}
+      windows_x64: ${{ needs.prep.outputs.win_x64 == 'true' }}
+      windows_arm64: ${{ needs.prep.outputs.win_arm64 == 'true' }}
+      linux_x64: ${{ needs.prep.outputs.linux_x64 == 'true' }}
+      linux_arm64: ${{ needs.prep.outputs.linux_arm64 == 'true' }}
+      android_arm64: ${{ needs.prep.outputs.android_arm64 == 'true' }}
+      android_x64: ${{ needs.prep.outputs.android_x64 == 'true' }}
+      macos_arm64: ${{ needs.prep.outputs.macos_arm64 == 'true' }}
+    # 必须显式继承：workflow_call 的被调工作流默认拿不到调用方的 secret，
+    # 不写这行时 build.yml 里的 secrets.ANDROID_KEYSTORE_* 恒为空 ——
+    # 表现是「secret 配了但 APK 仍用 debug key 签名」，且只留一条 ::warning::。
+    secrets: inherit
+
+  # ── Publish ──
+  publish:
+    name: 发布 ${{ needs.prep.outputs.channel }}
+    needs: [prep, build]
+    if: |
+      always() && !cancelled() &&
+      needs.prep.result == 'success' &&
+      needs.prep.outputs.channel != 'none' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f -ls
+
+      - name: Build release body
+        id: body
+        env:
+          CHANNEL: ${{ needs.prep.outputs.channel }}
+          TAG: ${{ needs.prep.outputs.tag }}
+          IN_RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          WIN_CELL=""
+          LINUX_CELL=""
+          MACOS_CELL=""
+          ANDROID_CELL=""
+          for f in artifacts/FlCroc-*; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            # 注意这里**不能**写成 \${{ github.repository }}：GitHub 一样会替换表达式，
+            # 但那个反斜杠会留在文本里，而 bash 双引号里 "\5" 的反斜杠是原样保留的
+            # （只有 \$ \` \" \\ 才转义）→ 生成 github.com/\owner/repo 这种死链。
+            # 旧 CI 的 nightly/release 正文里就是这个坏链接（已在 nightly 产物上核实）。
+            URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/$fname"
+            # 顺序有意义：每个平台的 arm64 分支必须排在它的通配分支之前，
+            # 否则 arm64 包会被当成 x64 打上 x64 徽章。
+            case "$fname" in
+              *windows-arm64*) WIN_CELL="$WIN_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/ARM64-blue.svg?logo=windows\"></a><br>" ;;
+              *windows*)       WIN_CELL="$WIN_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/x64-blue.svg?logo=windows\"></a><br>" ;;
+              *linux-arm64*)   LINUX_CELL="$LINUX_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/ARM64-orange.svg?logo=linux\"></a><br>" ;;
+              *linux*)         LINUX_CELL="$LINUX_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/x64-orange.svg?logo=linux\"></a><br>" ;;
+              *macos-arm64*)   MACOS_CELL="$MACOS_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/ARM64-lightgrey.svg?logo=apple\"></a><br>" ;;
+              *android-arm64*) ANDROID_CELL="$ANDROID_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/ARM64-green.svg?logo=android\"></a><br>" ;;
+              *android*)       ANDROID_CELL="$ANDROID_CELL<a href=\"$URL\"><img src=\"https://img.shields.io/badge/x64-green.svg?logo=android\"></a><br>" ;;
+            esac
+          done
+
+          # 发行说明来自 dispatch 的 release_notes 输入，**追加在正文最上方**：自动
+          # 生成的 Commit / 警告 / 下载表全部保留，只是排在它下面。push 触发时没有
+          # 这个输入（github.event.inputs 里不存在），渲染成空串 → 整段不插入。
+          NOTES_HEAD=""
+          if [ -n "${IN_RELEASE_NOTES:-}" ]; then
+            NOTES_HEAD="${IN_RELEASE_NOTES}"$'\n\n'
+          fi
+
+          # 旧 CI 这里是 "Automated dev-branch build" —— 那时 nightly 只在 dev 分支
+          # 有平台构建时产生。现在 push main 与 workflow_dispatch 都能产出 nightly，
+          # 且不限定分支（main / dev 都可能），故改成与分支无关的措辞。
+          if [ "$CHANNEL" = "nightly" ]; then
+            BODY="${NOTES_HEAD}**Commit**: \`$(git rev-parse --short HEAD)\`
+
+          $(git log -1 --pretty=%B)
+
+          > ⚠️ Nightly pre-release — may be unstable.
+
+          "
+          else
+            BODY="$NOTES_HEAD"
+          fi
+          BODY="${BODY}**Download based on your OS:**
+
+          <table>
+          <tr><th>Platform</th><th>Download</th></tr>"
+          [ -n "$WIN_CELL" ] && BODY="$BODY<tr><td>Windows</td><td>$WIN_CELL</td></tr>"
+          [ -n "$LINUX_CELL" ] && BODY="$BODY<tr><td>Linux</td><td>$LINUX_CELL</td></tr>"
+          [ -n "$MACOS_CELL" ] && BODY="$BODY<tr><td>macOS</td><td>$MACOS_CELL</td></tr>"
+          [ -n "$ANDROID_CELL" ] && BODY="$BODY<tr><td>Android</td><td>$ANDROID_CELL</td></tr>"
+          BODY="$BODY</table>"
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # nightly 的 tag 是 r<1000+提交数>，正常不会重复；同号重发（release 重发、或手动
+      # 重跑同一个 commit）时先清掉旧的，否则资产会追加到已存在的 release 上。
+      - name: Delete existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prep.outputs.tag }}
+        run: |
+          if gh release view "$TAG" &>/dev/null; then
+            echo "删除已存在的 release $TAG"
+            gh release delete "$TAG" --yes --cleanup-tag
+          else
+            echo "没有已存在的 release $TAG"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prep.outputs.tag }}
+          name: ${{ needs.prep.outputs.channel == 'nightly' && format('Nightly {0} {1}', needs.prep.outputs.version, needs.prep.outputs.nightly_date) || format('Release {0}', needs.prep.outputs.display_version) }}
+          body: ${{ steps.body.outputs.body }}
+          files: |
+            artifacts/FlCroc-*
+          draft: false
+          prerelease: ${{ needs.prep.outputs.prerelease }}
+          make_latest: ${{ needs.prep.outputs.channel == 'release' }}

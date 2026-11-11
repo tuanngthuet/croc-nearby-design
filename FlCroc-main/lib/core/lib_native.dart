@@ -1,0 +1,586 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:io';
+
+import 'package:ffi/ffi.dart';
+import 'package:fl_croc/common/common.dart';
+import 'package:fl_croc/core/interface.dart';
+import 'package:fl_croc/core/qr_matrix.dart';
+import 'package:fl_croc/models/models.dart';
+
+/// FFI binding for the Go croc bridge shared library.
+///
+/// Uses the croc fork in `submodules/croc/`, compiled into a shared library by
+/// the Go bridge in `go_bridge/`.
+class CoreLib._internal() extends CoreInterface {
+  static CoreLib? _instance;
+  DynamicLibrary? _lib;
+  bool _isAvailable = false;
+
+  void Function(Pointer<Utf8>)? _freeGoString;
+
+  // Share-code QR helpers. An older bridge library simply will not export them,
+  // which leaves the callers to fall back instead of failing.
+  Pointer<Utf8> Function(Pointer<Utf8>)? _webReceiveUrlFn;
+  Pointer<Utf8> Function(Pointer<Utf8>)? _qrCodeFn;
+  bool _qrExportsBound = false;
+
+  factory CoreLib() {
+    _instance ??= CoreLib._internal();
+    return _instance!;
+  }
+
+  @override
+  bool get isAvailable => _isAvailable;
+
+  @override
+  Future<bool> init() async {
+    try {
+      _lib = _loadLibrary();
+      if (_lib == null) return false;
+      _freeGoString = _lib!
+          .lookupFunction<
+            Void Function(Pointer<Utf8>),
+            void Function(Pointer<Utf8>)
+          >('CrocFreeString');
+      _bindQrExports();
+      _isAvailable = true;
+      return true;
+    } catch (e) {
+      commonPrint('Failed to load croc bridge: $e');
+      return false;
+    }
+  }
+
+  DynamicLibrary? _loadLibrary() {
+    try {
+      final libName = switch (Platform.operatingSystem) {
+        'linux' => 'libcroc_bridge.so',
+        'macos' => 'libcroc_bridge.dylib',
+        'windows' => 'libcroc_bridge.dll',
+        _ => 'libcroc_bridge.so',
+      };
+      // On Android, the .so is in jniLibs and loaded by name.
+      // On desktop, try the executable directory first, then system paths.
+      if (Platform.isAndroid) {
+        return DynamicLibrary.open(libName);
+      }
+      final exeDir = Directory(Platform.resolvedExecutable).parent.path;
+      final localPath = '$exeDir/$libName';
+      if (File(localPath).existsSync()) {
+        return DynamicLibrary.open(localPath);
+      }
+      // macOS: the .app bundle keeps its dylib in Contents/Frameworks — that is
+      // where the bundle's rpath (@executable_path/../Frameworks) points, and the
+      // only nested-code location codesign seals properly.
+      if (Platform.isMacOS) {
+        final fwPath = '$exeDir/../Frameworks/$libName';
+        if (File(fwPath).existsSync()) {
+          return DynamicLibrary.open(fwPath);
+        }
+      }
+      // Fallback: look in lib/ subdirectory (Linux bundle convention)
+      final libPath = '$exeDir/lib/$libName';
+      if (File(libPath).existsSync()) {
+        return DynamicLibrary.open(libPath);
+      }
+      return null;
+    } catch (e) {
+      commonPrint('Failed to load library: $e');
+    }
+    return null;
+  }
+
+  @override
+  Future<String> getVersion() async {
+    try {
+      final lib = _lib;
+      if (lib != null) {
+        final func = lib
+            .lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+              'CrocGetVersion',
+            );
+        final ptr = func();
+        final ver = ptr.toDartString();
+        _freeGoString?.call(ptr);
+        if (ver.isNotEmpty) return _stripCrocPrefix(ver);
+      }
+    } catch (_) {}
+    throw UnsupportedError('unavailable');
+  }
+
+  String _stripCrocPrefix(String raw) {
+    return raw.replaceAll(RegExp(r'^croc\s*v?'), '');
+  }
+
+  /// Builds a live progress update from a type-1 bridge event.
+  ///
+  /// The Go bridge samples croc's exported transfer counters every 200ms
+  /// (`TotalSent` is per-file, so the bridge accumulates the finished files on
+  /// top of it) and reports cumulative bytes plus a smoothed speed.
+  TransferProgress _liveProgress(
+    String transferId,
+    Map<String, dynamic> event,
+  ) {
+    // current_file_index is 1-based; 0 means the bridge has not resolved the
+    // manifest yet.
+    final fileIndex = (event['current_file_index'] as int?) ?? 0;
+    return TransferProgress(
+      transferId: transferId,
+      // The bridge reports `waiting` until the peer's handshake has finished,
+      // so "still looking for the other side" is not shown as a transfer that
+      // is already moving data.
+      status: event['phase'] == 'waiting'
+          ? TransferProgressStatus.connecting
+          : TransferProgressStatus.transferring,
+      totalFiles: (event['total_files'] as int?) ?? 0,
+      totalSize: (event['total_size'] as int?) ?? 0,
+      transferredSize: (event['transferred_size'] as int?) ?? 0,
+      currentFile: event['current_file'] as String? ?? '',
+      completedFiles: fileIndex > 0 ? fileIndex - 1 : 0,
+      speed: (event['speed'] as num?)?.toDouble() ?? 0.0,
+    );
+  }
+
+  @override
+  Future<String> generateCodePhrase() async {
+    final rng = DateTime.now().microsecondsSinceEpoch;
+    const adjectives = ['swift', 'bold', 'calm', 'keen', 'warm', 'cool'];
+    const nouns = ['falcon', 'jaguar', 'python', 'raven', 'otter'];
+    const verbs = ['dash', 'zoom', 'glide', 'soar', 'rush'];
+    return '${adjectives[rng % adjectives.length]}-'
+        '${nouns[(rng ~/ 2) % nouns.length]}-'
+        '${verbs[(rng ~/ 3) % verbs.length]}';
+  }
+
+  @override
+  Stream<TransferProgress> sendFiles(SendOptions options) async* {
+    final lib = _lib;
+    if (!_isAvailable || lib == null) {
+      yield const TransferProgress(
+        transferId: '',
+        status: TransferProgressStatus.failed,
+        error: 'croc bridge not available',
+      );
+      return;
+    }
+
+    // The bridge owns the transfer id — CrocCancelTransfer compares it, so
+    // Dart must not invent one of its own.
+    var transferId = '';
+
+    try {
+      final sendFunc = lib
+          .lookupFunction<
+            Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>),
+            Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)
+          >('CrocSendFiles');
+
+      final pathsJson = jsonEncode(options.filePaths);
+      final opts = <String, dynamic>{};
+      if (options.codePhrase != null && options.codePhrase!.isNotEmpty) {
+        opts['code_phrase'] = options.codePhrase;
+      }
+      if (options.sendingText) {
+        opts['sending_text'] = true;
+        opts['text_content'] = options.textContent;
+      }
+      if (options.curve != 'p256') opts['curve'] = options.curve;
+      if (options.hashAlgorithm != 'xxhash') {
+        opts['hash_algorithm'] = options.hashAlgorithm;
+      }
+      if (options.noCompress) opts['no_compress'] = true;
+      if (options.overwrite) opts['overwrite'] = true;
+      if (options.zipFolder) opts['zip_folder'] = true;
+      if (options.gitIgnore) opts['git_ignore'] = true;
+      if (options.onlyLocal) opts['only_local'] = true;
+      if (options.disableLocal) opts['disable_local'] = true;
+      if (options.relayAddress != null && options.relayAddress!.isNotEmpty) {
+        opts['relay_address'] = options.relayAddress;
+      }
+      if (options.relayAddress6 != null && options.relayAddress6!.isNotEmpty) {
+        opts['relay_address6'] = options.relayAddress6;
+      }
+      if (options.relayPassword != null && options.relayPassword!.isNotEmpty) {
+        opts['relay_password'] = options.relayPassword;
+      }
+      if (options.relayPorts != null && options.relayPorts!.isNotEmpty) {
+        opts['relay_ports'] = options.relayPorts;
+      }
+      if (options.exclude.isNotEmpty) opts['exclude'] = options.exclude;
+      if (options.tempDir.isNotEmpty) opts['temp_dir'] = options.tempDir;
+      // Always sent, so the bridge never has to guess. `true` keeps croc away
+      // from the OS clipboard.
+      opts['disable_clipboard'] = options.disableClipboard;
+      opts['transport'] = options.transport;
+      if (options.throttleUpload.isNotEmpty) {
+        opts['throttle_upload'] = options.throttleUpload;
+      }
+      if (options.socks5Proxy.isNotEmpty) {
+        opts['socks5_proxy'] = options.socks5Proxy;
+      }
+      if (options.httpProxy.isNotEmpty) {
+        opts['http_proxy'] = options.httpProxy;
+      }
+      final optsJson = jsonEncode(opts);
+
+      final pathsPtr = pathsJson.toNativeUtf8();
+      final optsPtr = optsJson.toNativeUtf8();
+      final resultPtr = sendFunc(pathsPtr, optsPtr);
+      final resultJson = resultPtr.toDartString();
+
+      malloc.free(pathsPtr); // Dart-allocated
+      malloc.free(optsPtr); // Dart-allocated
+      _freeGoString?.call(resultPtr); // Go-allocated
+
+      final result = jsonDecode(resultJson) as Map<String, dynamic>;
+      commonPrint('CrocSendFiles result: $result');
+      if (result.containsKey('error')) {
+        final err = result['error'] as String?;
+        commonPrint('CrocSendFiles error: $err');
+        yield TransferProgress(
+          transferId: transferId,
+          status: TransferProgressStatus.failed,
+          error: err,
+        );
+        return;
+      }
+
+      transferId = result['transfer_id'] as String? ?? '';
+
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.initializing,
+      );
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.connecting,
+        codePhrase: result['code_phrase'] as String?,
+      );
+
+      final pollFunc = lib
+          .lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+            'CrocPollProgress',
+          );
+
+      while (true) {
+        await Future.pause(const Duration(milliseconds: 200));
+        try {
+          final pollPtr = pollFunc();
+          final pollJson = pollPtr.toDartString();
+          _freeGoString?.call(pollPtr);
+
+          if (pollJson == 'null' || pollJson == '{}') continue;
+          if (pollJson.length < 5) continue; // too short to be valid JSON
+
+          final event = jsonDecode(pollJson) as Map<String, dynamic>;
+          final type = event['type'] as int? ?? 0;
+
+          if (type == 1) {
+            yield _liveProgress(transferId, event);
+          } else if (type == 2) {
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.completed,
+              totalFiles: (event['total_files'] as int?) ?? 0,
+              totalSize: (event['total_size'] as int?) ?? 0,
+              currentFile: event['current_file'] as String? ?? '',
+              isText: event['is_text'] as bool? ?? false,
+              textContent: event['text_content'] as String? ?? '',
+            );
+            return;
+          } else if (type == 3) {
+            final err = event['error'] as String?;
+            commonPrint('Send poll error: $err');
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.failed,
+              error: err,
+            );
+            return;
+          } else if (type == 4) {
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.connecting,
+              totalFiles: (event['total_files'] as int?) ?? 0,
+              totalSize: (event['total_size'] as int?) ?? 0,
+              codePhrase: event['code_phrase'] as String?,
+            );
+          } else if (type == 5) {
+            // croc v11 reconnect notice (from Go bridge stderr capture).
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.transferring,
+              error: event['error'] as String?,
+            );
+          }
+        } catch (_) {}
+      }
+    } catch (e) {
+      commonPrint('Send exception: $e');
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.failed,
+        error: e.toString(),
+      );
+    }
+  }
+
+  @override
+  Stream<TransferProgress> receiveFiles(ReceiveOptions options) async* {
+    final lib = _lib;
+    if (!_isAvailable || lib == null) {
+      const err = 'croc bridge not available';
+      commonPrint('Receive failed: $err');
+      yield const TransferProgress(
+        transferId: '',
+        status: TransferProgressStatus.failed,
+        error: err,
+      );
+      return;
+    }
+
+    // The bridge owns the transfer id — CrocCancelTransfer compares it, so
+    // Dart must not invent one of its own.
+    var transferId = '';
+
+    try {
+      final recvFunc = lib
+          .lookupFunction<
+            Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>),
+            Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>)
+          >('CrocReceiveFiles');
+
+      final opts = <String, dynamic>{};
+      if (options.curve != 'p256') opts['curve'] = options.curve;
+      if (options.overwrite) opts['overwrite'] = true;
+      if (options.onlyLocal) opts['only_local'] = true;
+      // Always sent: true keeps croc from asking on stdin (and silently
+      // skipping the file) when the destination name is taken.
+      opts['rename'] = options.rename;
+      if (options.socks5Proxy.isNotEmpty) {
+        opts['socks5_proxy'] = options.socks5Proxy;
+      }
+      if (options.httpProxy.isNotEmpty) {
+        opts['http_proxy'] = options.httpProxy;
+      }
+      if (options.outputPath.isNotEmpty) {
+        opts['output_path'] = options.outputPath;
+      }
+      if (options.relayAddress != null && options.relayAddress!.isNotEmpty) {
+        opts['relay_address'] = options.relayAddress;
+      }
+      if (options.relayAddress6 != null && options.relayAddress6!.isNotEmpty) {
+        opts['relay_address6'] = options.relayAddress6;
+      }
+      if (options.relayPassword != null && options.relayPassword!.isNotEmpty) {
+        opts['relay_password'] = options.relayPassword;
+      }
+      if (options.relayPorts != null && options.relayPorts!.isNotEmpty) {
+        opts['relay_ports'] = options.relayPorts;
+      }
+      // Always include hash_algorithm so receiver matches sender's hash
+      opts['hash_algorithm'] = 'xxhash';
+      final optsJson = jsonEncode(opts);
+
+      final codePtr = options.codePhrase.toNativeUtf8();
+      final optsPtr = optsJson.toNativeUtf8();
+      final resultPtr = recvFunc(codePtr, optsPtr);
+      final resultJson = resultPtr.toDartString();
+
+      malloc.free(codePtr); // Dart-allocated
+      malloc.free(optsPtr); // Dart-allocated
+      _freeGoString?.call(resultPtr); // Go-allocated
+
+      final result = jsonDecode(resultJson) as Map<String, dynamic>;
+      commonPrint('CrocReceiveFiles result: $result');
+      if (result.containsKey('error')) {
+        final err = result['error'] as String?;
+        commonPrint('CrocReceiveFiles error: $err');
+        yield TransferProgress(
+          transferId: transferId,
+          status: TransferProgressStatus.failed,
+          error: err,
+        );
+        return;
+      }
+
+      transferId = result['transfer_id'] as String? ?? '';
+
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.initializing,
+      );
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.connecting,
+      );
+
+      final pollFunc = lib
+          .lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+            'CrocPollProgress',
+          );
+
+      while (true) {
+        await Future.pause(const Duration(milliseconds: 200));
+        try {
+          final pollPtr = pollFunc();
+          final pollJson = pollPtr.toDartString();
+          _freeGoString?.call(pollPtr);
+
+          if (pollJson == 'null' || pollJson == '{}') continue;
+          if (pollJson.length < 5) continue;
+
+          final event = jsonDecode(pollJson) as Map<String, dynamic>;
+          final type = event['type'] as int? ?? 0;
+
+          if (type == 1) {
+            yield _liveProgress(transferId, event);
+          } else if (type == 2) {
+            if (event['transfer_id'] != 'closed') {
+              yield TransferProgress(
+                transferId: transferId,
+                status: TransferProgressStatus.completed,
+                totalFiles: (event['total_files'] as int?) ?? 0,
+                totalSize: (event['total_size'] as int?) ?? 0,
+                currentFile: event['current_file'] as String? ?? '',
+                isText: event['is_text'] as bool? ?? false,
+                textContent: event['text_content'] as String? ?? '',
+              );
+            }
+            return;
+          } else if (type == 3) {
+            final err = event['error'] as String?;
+            commonPrint('Receive poll error: $err');
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.failed,
+              error: err,
+            );
+            return;
+          } else if (type == 4) {
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.connecting,
+              totalFiles: (event['total_files'] as int?) ?? 0,
+              totalSize: (event['total_size'] as int?) ?? 0,
+            );
+          } else if (type == 5) {
+            // croc v11 reconnect notice (from Go bridge stderr capture).
+            yield TransferProgress(
+              transferId: transferId,
+              status: TransferProgressStatus.transferring,
+              error: event['error'] as String?,
+            );
+          }
+        } catch (_) {
+          // Ignore malformed poll events
+        }
+      }
+    } catch (e) {
+      commonPrint('Receive exception: $e');
+      yield TransferProgress(
+        transferId: transferId,
+        status: TransferProgressStatus.failed,
+        error: e.toString(),
+      );
+    }
+  }
+
+  @override
+  Future<bool> cancelTransfer(String transferId) async {
+    final lib = _lib;
+    if (!_isAvailable || lib == null) return false;
+    try {
+      final func = lib
+          .lookupFunction<
+            Int32 Function(Pointer<Utf8>),
+            int Function(Pointer<Utf8>)
+          >('CrocCancelTransfer');
+      final ptr = transferId.toNativeUtf8();
+      final result = func(ptr);
+      malloc.free(ptr);
+      return result == 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> shutdown() async {
+    _lib = null;
+    _isAvailable = false;
+    return true;
+  }
+
+  // ── Share-code QR ──
+
+  /// Binds the share-code exports, tolerating a bridge library built without
+  /// them rather than failing the whole backend.
+  void _bindQrExports() {
+    final lib = _lib;
+    if (lib == null || _qrExportsBound) return;
+    _qrExportsBound = true;
+    try {
+      _webReceiveUrlFn = lib
+          .lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>), _StringFn>(
+            'CrocWebReceiveURL',
+          );
+      _qrCodeFn = lib
+          .lookupFunction<Pointer<Utf8> Function(Pointer<Utf8>), _StringFn>(
+            'CrocQRCode',
+          );
+    } catch (e) {
+      commonPrint('croc bridge has no QR exports: $e');
+    }
+  }
+
+  @override
+  String webReceiveUrl(String code) {
+    if (code.isEmpty) return '';
+    return _callString(_webReceiveUrlFn, code) ?? '';
+  }
+
+  @override
+  QrMatrix? qrCodeMatrix(String text) {
+    if (text.isEmpty) return null;
+    final raw = _callString(_qrCodeFn, text);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) return null;
+      final error = decoded['error'];
+      if (error != null) {
+        commonPrint('CrocQRCode: $error');
+        return null;
+      }
+      return QrMatrix.tryParse(decoded);
+    } catch (e) {
+      commonPrint('CrocQRCode returned unreadable JSON: $e');
+      return null;
+    }
+  }
+
+  /// Calls a bridge export that takes and returns a C string, freeing both. The
+  /// input is copied by toNativeUtf8, so the Go side never keeps the pointer.
+  String? _callString(_StringFn? fn, String arg) {
+    if (fn == null) return null;
+    final input = arg.toNativeUtf8();
+    try {
+      final out = fn(input);
+      try {
+        return out.toDartString();
+      } finally {
+        _freeGoString?.call(out);
+      }
+    } catch (e) {
+      commonPrint('croc bridge call failed: $e');
+      return null;
+    } finally {
+      malloc.free(input);
+    }
+  }
+}
+
+typedef _StringFn = Pointer<Utf8> Function(Pointer<Utf8>);

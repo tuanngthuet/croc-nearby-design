@@ -1,0 +1,1684 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:fl_croc/common/common.dart';
+import 'package:fl_croc/controller.dart';
+import 'package:fl_croc/core/controller.dart';
+import 'package:fl_croc/enum/enum.dart';
+import 'package:fl_croc/l10n/l10n.dart';
+import 'package:fl_croc/models/models.dart';
+import 'package:fl_croc/providers/providers.dart';
+import 'package:fl_croc/widgets/widgets.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path_provider/path_provider.dart';
+
+enum PhraseMode() {
+  defaultMode,
+  on,
+  never,
+}
+
+class const SendView({super.key}) extends ConsumerStatefulWidget {
+  @override
+  ConsumerState<SendView> createState() => _SendViewState();
+}
+
+class _SendViewState()
+    extends ConsumerState<SendView>
+    with TickerProviderStateMixin {
+  final List<FileItem> _selectedFiles = [];
+  bool _isTextMode = false;
+  bool _dragOverFile = false;
+  bool _isPhrasePasteMode = true; // phrase field: default paste
+  PhraseMode _phraseMode = PhraseMode.defaultMode;
+  SendPhase _phase = SendPhase.idle;
+
+  final _textController = TextEditingController();
+  final _codeController = TextEditingController();
+  SendConfig _sendConfig = const SendConfig();
+  bool _autoCopyPhrase = false;
+  bool _whiteBgQR = false; // always use white background for QR code
+
+  // Text size limit: null=default(10000), 0=unlimited, >0=custom
+  int? _textByteLimit;
+  static const _defaultTextLimit = 10000;
+  final _limitCtrl = TextEditingController();
+
+  // Comma-separated substrings excluded from the transfer (croc --exclude).
+  final _excludeCtrl = TextEditingController();
+
+  // Upload cap ("500k") and proxy addresses.
+  final _throttleCtrl = TextEditingController();
+  final _socks5Ctrl = TextEditingController();
+  final _httpProxyCtrl = TextEditingController();
+
+  // Live progress reported by the bridge (type-1 events, see CoreLib._liveProgress).
+  double _progress = 0;
+  double _speed = 0;
+  int _completedFiles = 0;
+  int _totalFiles = 0;
+  String _currentFile = '';
+  bool _isPasteMode = true;
+
+  /// Fraction of the transfer that is done, or -1 while the bridge has not
+  /// reported a total size yet (renders as an indeterminate ring).
+  double get _progressRatio {
+    if (_progress >= 1) return 1;
+    return _progress;
+  }
+
+  void _resetProgress() {
+    _progress = 0;
+    _speed = 0;
+    _completedFiles = 0;
+    _totalFiles = 0;
+    _currentFile = '';
+  }
+
+  DateTime? _lastRecordPersist;
+  static const _recordPersistInterval = Duration(seconds: 1);
+
+  /// `updateTransferRecord` writes the history to prefs, so during a transfer
+  /// (progress events every 200ms) only persist about once a second.
+  bool _shouldPersistRecord() {
+    final now = DateTime.now();
+    final last = _lastRecordPersist;
+    if (last != null && now.difference(last) < _recordPersistInterval) {
+      return false;
+    }
+    _lastRecordPersist = now;
+    return true;
+  }
+
+  int get _effectiveTextLimit => _textByteLimit ?? _defaultTextLimit;
+
+  StreamSubscription<TransferProgress>? _sendSubscription;
+  String? _activeTransferId;
+  String? _activeRecordId;
+
+  late AnimationController _shakeCtrl;
+  late Animation<double> _shakeAnim;
+  int _shakeTarget = -1; // -1:none, 0:files, 1:text, 2:phrase
+
+  // Persist code phrase across page switches
+  static String _savedCodePhrase = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _shakeCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+    );
+    _shakeAnim = Tween<double>(
+      begin: 0,
+      end: 2 * pi * 3,
+    ).animate(CurvedAnimation(parent: _shakeCtrl, curve: Curves.elasticIn));
+    _loadSendPrefs();
+    _textController.addListener(_enforceTextLimit);
+    if (_savedCodePhrase.isNotEmpty) {
+      _codeController.text = _savedCodePhrase;
+    }
+    _pickUpSharedFiles();
+  }
+
+  /// Pick up files shared via Android/iOS "Open with" intent.
+  void _pickUpSharedFiles() {
+    final paths = ref.read(pendingSharedFilesProvider);
+    if (paths.isEmpty) return;
+    final newFiles = <FileItem>[];
+    for (final p in paths) {
+      if (_selectedFiles.any((s) => s.path == p)) continue;
+      final item = fileItemForPath(p);
+      if (item != null) newFiles.add(item);
+    }
+    if (newFiles.isNotEmpty) {
+      setState(() {
+        _selectedFiles.addAll(newFiles);
+        _isTextMode = false;
+      });
+    }
+    ref.read(pendingSharedFilesProvider.notifier).clearPaths();
+  }
+
+  bool _limiting = false;
+
+  void _enforceTextLimit() {
+    if (_limiting) return;
+    final limit = _effectiveTextLimit;
+    if (limit <= 0) return; // unlimited
+    final bytes = utf8.encode(_textController.text);
+    if (bytes.length > limit) {
+      _limiting = true;
+      var truncated = '';
+      var byteCount = 0;
+      for (final char in _textController.text.characters) {
+        final charBytes = utf8.encode(char);
+        if (byteCount + charBytes.length > limit) break;
+        truncated += char;
+        byteCount += charBytes.length;
+      }
+      final oldSelection = _textController.selection;
+      _textController.text = truncated;
+      if (oldSelection.baseOffset <= truncated.length) {
+        _textController.selection = oldSelection;
+      }
+      _limiting = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _savedCodePhrase = _codeController.text;
+    _saveSendPrefs();
+    _sendSubscription?.cancel();
+    _textController.dispose();
+    _codeController.dispose();
+    _shakeCtrl.dispose();
+    _limitCtrl.dispose();
+    _excludeCtrl.dispose();
+    _throttleCtrl.dispose();
+    _socks5Ctrl.dispose();
+    _httpProxyCtrl.dispose();
+    super.dispose();
+  }
+
+  void _shake(int target) {
+    try {
+      _shakeTarget = target;
+      _shakeCtrl.forward(from: 0).then((_) => _shakeTarget = -1);
+    } catch (_) {
+      _shakeTarget = -1;
+    }
+  }
+
+  // ── File management ──
+
+  String? _selectedFolder;
+
+  Future<void> _pickFiles() async {
+    final files = await toFileItems(await FilePicker.pickFiles());
+    if (files.isNotEmpty) {
+      setState(() => _selectedFiles.addAll(files));
+    }
+  }
+
+  Future<void> _pickFolder() async {
+    final path = await FilePicker.getDirectoryPath();
+    if (path != null) {
+      setState(() {
+        _selectedFolder = path;
+        _selectedFiles.clear();
+      });
+    }
+  }
+
+  void _removeFile(int index) => setState(() => _selectedFiles.removeAt(index));
+  void _clearFiles() {
+    setState(() {
+      _selectedFiles.clear();
+      _selectedFolder = null;
+    });
+    if (mounted) context.showSnackBar(context.appLocalizations.cleared);
+  }
+
+  void _clearText() {
+    _textController.clear();
+    if (mounted) context.showSnackBar(context.appLocalizations.cleared);
+  }
+
+  void _copyText() {
+    if (_textController.text.isNotEmpty) {
+      Clipboard.setData(ClipboardData(text: _textController.text));
+      if (mounted) context.showSnackBar(context.appLocalizations.copied);
+    }
+  }
+
+  void _pasteText() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (data?.text != null && data!.text!.isNotEmpty) {
+      _textController.text = data.text!;
+      if (mounted) context.showSnackBar(context.appLocalizations.pasted);
+    }
+  }
+
+  Future<void> _pickTextFile() async {
+    final files = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: [
+        'txt',
+        'md',
+        'json',
+        'xml',
+        'csv',
+        'log',
+        'yaml',
+        'yml',
+      ],
+    );
+    if (files.isNotEmpty) {
+      final file = files.first;
+      if (file.path != null) {
+        final content = await File(file.path!).readAsString();
+        final limited = _applyTextLimit(content);
+        _textController.text = limited;
+      }
+    }
+  }
+
+  /// Truncate text to the effective byte limit, respecting character boundaries.
+  String _applyTextLimit(String text) {
+    final limit = _effectiveTextLimit;
+    if (limit <= 0) return text;
+    final bytes = utf8.encode(text);
+    if (bytes.length <= limit) return text;
+    var result = '';
+    var count = 0;
+    for (final char in text.characters) {
+      final cb = utf8.encode(char);
+      if (count + cb.length > limit) break;
+      result += char;
+      count += cb.length;
+    }
+    return result;
+  }
+
+  // ── Code phrase ──
+
+  void _generateCode() {
+    const adj = [
+      'swift',
+      'bold',
+      'calm',
+      'keen',
+      'warm',
+      'cool',
+      'fast',
+      'bright',
+      'sharp',
+      'pure',
+      'free',
+      'wild',
+    ];
+    const nouns = [
+      'falcon',
+      'jaguar',
+      'python',
+      'raven',
+      'otter',
+      'eagle',
+      'tiger',
+      'whale',
+      'hawk',
+      'wolf',
+      'bear',
+    ];
+    final rng = Random();
+    final a = adj[rng.nextInt(adj.length)];
+    final n = nouns[rng.nextInt(nouns.length)];
+    final dc = 3 + rng.nextInt(3);
+    final min = pow(10, dc - 1).toInt();
+    final max = pow(10, dc).toInt() - 1;
+    final d = min + rng.nextInt(max - min + 1);
+    _codeController.text = '$a-$n-$d';
+    if (_autoCopyPhrase) _copyPhrase();
+  }
+
+  void _copyPhrase() {
+    final p = _codeController.text.trim();
+    if (p.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: p));
+    if (mounted) context.showSnackBar(context.appLocalizations.codeCopied);
+  }
+
+  void _pastePhrase() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (data?.text != null && data!.text!.isNotEmpty) {
+      _codeController.text = normalizeShareCode(data.text!);
+      if (mounted) context.showSnackBar(context.appLocalizations.codePasted);
+    }
+  }
+
+  void _showQRCode() {
+    final code = _currentPhrase;
+    if (code.isEmpty) {
+      if (mounted) context.showSnackBar(context.appLocalizations.phraseEmpty);
+      return;
+    }
+    final payload = _qrPayload;
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        final l10n = context.appLocalizations;
+        return AlertDialog(
+          title: Text(l10n.generateQRCode),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(width: 200, height: 200, child: _buildQR(payload, 200)),
+              const SizedBox(height: 12),
+              Text(
+                code,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: code));
+                if (mounted) {
+                  context.showSnackBar(context.appLocalizations.codeCopied);
+                }
+              },
+              child: Text(l10n.copy),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text(l10n.confirm),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// The share code as croc should see it: a URL in the field — pasted, typed or
+  /// left over from a previous session — is reduced to its `code` parameter.
+  String get _currentPhrase => normalizeShareCode(_codeController.text);
+  bool get _allowEmptyPhrase => _phraseMode == PhraseMode.defaultMode;
+
+  // ── Persistence ──
+
+  static const _prefAutoCopy = 'send_autoCopy';
+  static const _prefPhraseMode = 'send_phraseMode';
+  static const _prefIsTextMode = 'send_isTextMode';
+  static const _prefTextByteLimit = 'send_textByteLimit';
+  static const _prefWhiteBgQR = 'send_whiteBgQR';
+
+  void _loadSendPrefs() {
+    _sendConfig = SendConfig.load();
+    _autoCopyPhrase = AppPrefs.getBool(_prefAutoCopy);
+    final pmIdx = AppPrefs.getString(_prefPhraseMode);
+    if (pmIdx.isNotEmpty) {
+      _phraseMode = PhraseMode.values[int.tryParse(pmIdx) ?? 0];
+    }
+    _isTextMode = AppPrefs.getBool(_prefIsTextMode);
+    _whiteBgQR = AppPrefs.getBool(_prefWhiteBgQR);
+    final limitStr = AppPrefs.getString(_prefTextByteLimit);
+    if (limitStr.isNotEmpty) {
+      _textByteLimit = int.tryParse(limitStr);
+      if (_textByteLimit != null && _textByteLimit! > 0) {
+        _limitCtrl.text = _textByteLimit.toString();
+      }
+    }
+    _excludeCtrl.text = _sendConfig.exclude.join(', ');
+    _throttleCtrl.text = _sendConfig.throttleUpload;
+    _socks5Ctrl.text = _sendConfig.socks5Proxy;
+    _httpProxyCtrl.text = _sendConfig.httpProxy;
+  }
+
+  void _saveSendPrefs() {
+    _sendConfig.save();
+    AppPrefs.setBool(_prefAutoCopy, _autoCopyPhrase);
+    AppPrefs.setString(_prefPhraseMode, _phraseMode.index.toString());
+    AppPrefs.setBool(_prefIsTextMode, _isTextMode);
+    AppPrefs.setBool(_prefWhiteBgQR, _whiteBgQR);
+    AppPrefs.setString(_prefTextByteLimit, _textByteLimit?.toString() ?? '');
+  }
+
+  // ── Send ──
+
+  Future<void> _startSend() async {
+    final l10n = context.appLocalizations;
+    try {
+      await _doSend();
+    } catch (e, s) {
+      debugPrint('_startSend crashed: $e\n$s');
+      if (mounted) {
+        setState(() => _phase = SendPhase.fail);
+        _showWarning('${l10n.sendFailed}: $e');
+      }
+    }
+  }
+
+  Future<void> _doSend() async {
+    final l10n = context.appLocalizations;
+
+    if (!coreController.isAvailable) {
+      setState(() => _phase = SendPhase.fail);
+      _showWarning(l10n.noCrocBackend);
+      return;
+    }
+
+    final isText = _isTextMode;
+    final textContent = _textController.text.trim();
+
+    if (!isText && _selectedFiles.isEmpty && _selectedFolder == null) {
+      _showWarning(l10n.noFiles);
+      _shake(0); // shake file section
+      return;
+    }
+    if (isText && textContent.isEmpty) {
+      _showWarning(l10n.enterTextWarning);
+      _shake(1); // shake text area
+      return;
+    }
+
+    String code = _currentPhrase;
+    if (_phraseMode == PhraseMode.on) {
+      _generateCode();
+      code = _currentPhrase;
+    }
+
+    if (code.isEmpty) {
+      if (_allowEmptyPhrase) {
+      } else {
+        _showWarning(l10n.enterPhraseWarning);
+        _shake(2); // shake phrase field
+        return;
+      }
+    }
+
+    setState(() => _phase = SendPhase.pending);
+
+    // Generate transfer ID early so cancel can always find it
+    final transferId = appController.generateId();
+    _activeTransferId = transferId;
+
+    final files = isText
+        ? [FileItem(name: textContent, path: '', size: textContent.length)]
+        : _selectedFolder != null
+        ? [
+            FileItem(
+              name: _selectedFolder!.split(Platform.pathSeparator).last,
+              path: _selectedFolder!,
+              size: 0,
+            ),
+          ]
+        : _selectedFiles;
+    final totalSize = isText
+        ? textContent.length
+        : files.fold<int>(0, (a, f) => a + f.size);
+
+    final record = TransferRecord(
+      id: transferId,
+      direction: TransferDirection.sent,
+      status: TransferStatus.pending,
+      files: files,
+      totalSize: totalSize,
+      startTime: DateTime.now(),
+      codePhrase: code.isNotEmpty ? code : '(croc)',
+    );
+    appController.addTransferRecord(record);
+    _activeRecordId = record.id;
+
+    final relayConfig = ref.read(appSettingProvider).relayConfig;
+    final useNoRelay = relayConfig.type == RelayType.noRelay;
+    final useCustom = relayConfig.type == RelayType.customRelay;
+
+    // croc refuses a non-auto transport together with --local (OnlyLocal), so
+    // fall back to auto rather than letting croc.New fail mid-flight.
+    final transport = useNoRelay ? 'auto' : _sendConfig.transport;
+    if (useNoRelay && _sendConfig.transport != 'auto' && mounted) {
+      context.showSnackBar(l10n.transportLocalConflict);
+    }
+
+    // Resolve file paths for Go bridge (Android content URIs → temp files)
+    final resolvedPaths = <String>[];
+    String? tempDirPath;
+    if (!isText) {
+      if (_selectedFolder != null) {
+        resolvedPaths.add(_selectedFolder!);
+      } else {
+        for (final f in _selectedFiles) {
+          final p = f.path;
+          if (p.isEmpty) continue;
+          if (isAndroid && p.startsWith('content://')) {
+            try {
+              final bytes = await File(p).readAsBytes();
+              tempDirPath ??= (await getTemporaryDirectory()).path;
+              final tempFile = File(
+                '$tempDirPath${Platform.pathSeparator}${f.name}',
+              );
+              await tempFile.writeAsBytes(bytes);
+              resolvedPaths.add(tempFile.path);
+            } catch (_) {}
+          } else {
+            resolvedPaths.add(p);
+          }
+        }
+      }
+    }
+    if (isText) {
+      tempDirPath = (await getTemporaryDirectory()).path;
+    }
+
+    final options = SendOptions(
+      filePaths: isText ? [] : resolvedPaths,
+      codePhrase: code.isEmpty ? null : code,
+      sendingText: isText,
+      textContent: isText ? textContent : '',
+      tempDir: tempDirPath ?? '',
+      curve: _sendConfig.curve,
+      hashAlgorithm: _sendConfig.hashAlgorithm,
+      noCompress: _sendConfig.noCompress,
+      overwrite: _sendConfig.overwrite,
+      zipFolder: _sendConfig.zipFolder,
+      // Forwarded here, otherwise the toggles below do nothing.
+      gitIgnore: _sendConfig.gitIgnore,
+      disableLocal: _sendConfig.disableLocal,
+      exclude: _sendConfig.exclude,
+      transport: transport,
+      throttleUpload: _sendConfig.throttleUpload,
+      socks5Proxy: _sendConfig.socks5Proxy,
+      httpProxy: _sendConfig.httpProxy,
+      onlyLocal: useNoRelay,
+      // A GUI must not clobber the clipboard unless the user asked for it.
+      disableClipboard: !_sendConfig.copyCodeToClipboard,
+      relayAddress: useCustom ? relayConfig.address : null,
+      relayPassword: useCustom ? relayConfig.password : null,
+      relayPorts: useCustom ? relayConfig.port : null,
+    );
+
+    // Stay in [SendPhase.pending] ("waiting") until the bridge reports that
+    // the peer has joined; the transfer is not sending anything before that.
+    setState(_resetProgress);
+
+    _sendSubscription = coreController
+        .sendFiles(options)
+        .listen(
+          (progress) {
+            if (!mounted) return;
+            _activeTransferId = progress.transferId;
+            if (progress.codePhrase != null &&
+                progress.codePhrase!.isNotEmpty) {
+              _codeController.text = progress.codePhrase!;
+              appController.updateTransferRecord(
+                record.copyWith(codePhrase: progress.codePhrase),
+              );
+              if (_autoCopyPhrase) _copyPhrase();
+              setState(() {}); // rebuild to show QR code
+            }
+            switch (progress.status) {
+              case TransferProgressStatus.completed:
+                appController.setSpeed(record.id, 0);
+                setState(() {
+                  _progress = 1;
+                  _completedFiles = _totalFiles;
+                  _speed = 0;
+                  _phase = SendPhase.success;
+                });
+                appController.updateTransferRecord(
+                  record.copyWith(
+                    status: TransferStatus.completed,
+                    transferredSize: totalSize,
+                    endTime: DateTime.now(),
+                  ),
+                );
+                _sendSubscription = null;
+                break;
+              case TransferProgressStatus.failed:
+                appController.setSpeed(record.id, 0);
+                setState(() => _phase = SendPhase.fail);
+                appController.updateTransferRecord(
+                  record.copyWith(
+                    status: TransferStatus.failed,
+                    endTime: DateTime.now(),
+                  ),
+                );
+                if (progress.error != null && mounted) {
+                  commonPrint('Send failed: ${progress.error}');
+                  context.showSnackBar(
+                    l10n.localizeCrocError(progress.error!, isSend: true),
+                  );
+                }
+                _sendSubscription = null;
+                break;
+              case TransferProgressStatus.cancelled:
+                appController.setSpeed(record.id, 0);
+                setState(() => _phase = SendPhase.cancelled);
+                appController.updateTransferRecord(
+                  record.copyWith(
+                    status: TransferStatus.cancelled,
+                    endTime: DateTime.now(),
+                  ),
+                );
+                _sendSubscription = null;
+                break;
+              case TransferProgressStatus.initializing:
+              case TransferProgressStatus.connecting:
+                break;
+              case TransferProgressStatus.transferring:
+                setState(() {
+                  if (_phase == SendPhase.pending) _phase = SendPhase.sending;
+                  if (progress.totalSize > 0) {
+                    _progress = (progress.transferredSize / progress.totalSize)
+                        .clamp(0.0, 1.0);
+                  }
+                  if (progress.totalFiles > 0) {
+                    _totalFiles = progress.totalFiles;
+                  }
+                  _completedFiles = progress.completedFiles;
+                  if (progress.currentFile.isNotEmpty) {
+                    _currentFile = progress.currentFile;
+                  }
+                  if (progress.speed > 0) _speed = progress.speed;
+                });
+                appController.setSpeed(record.id, progress.speed);
+                // Persisting the record writes prefs, so throttle it while the
+                // bridge reports every 200ms.
+                if (_shouldPersistRecord()) {
+                  appController.updateTransferRecord(
+                    record.copyWith(
+                      status: TransferStatus.transferring,
+                      transferredSize: progress.transferredSize,
+                    ),
+                  );
+                }
+                break;
+            }
+          },
+          onError: (e) {
+            if (!mounted) return;
+            setState(() => _phase = SendPhase.fail);
+            appController.updateTransferRecord(
+              record.copyWith(
+                status: TransferStatus.failed,
+                endTime: DateTime.now(),
+              ),
+            );
+            context.showSnackBar(
+              l10n.localizeCrocError(e.toString(), isSend: true),
+            );
+            commonPrint('Send error: $e');
+            _sendSubscription = null;
+          },
+          onDone: () {
+            if (mounted &&
+                _phase != SendPhase.success &&
+                _phase != SendPhase.cancelled) {
+              setState(() => _phase = SendPhase.fail);
+            }
+            _sendSubscription = null;
+          },
+        );
+  }
+
+  Future<void> _cancelSend() async {
+    if (mounted) setState(() => _phase = SendPhase.cancelled);
+    final rid = _activeRecordId;
+    if (rid != null) appController.setSpeed(rid, 0);
+
+    // Always attempt Go-side cancel first — it uses the global activeClient
+    final tid = _activeTransferId;
+    if (tid != null) {
+      coreController.cancelTransfer(tid);
+    }
+    // Then cancel the stream subscription (non-null only after listen starts)
+    final sub = _sendSubscription;
+    if (sub != null) {
+      await sub.cancel();
+      _sendSubscription = null;
+    }
+
+    await Future.delayed(const Duration(seconds: 2));
+    if (mounted && _phase == SendPhase.cancelled) {
+      setState(() => _phase = SendPhase.idle);
+    }
+  }
+
+  void _showWarning(String msg) {
+    context.showSnackBar(msg);
+  }
+
+  // ── Build ──
+
+  Widget _buildQR(String data, double size) {
+    final fg = _whiteBgQR
+        ? Colors.black
+        : (Theme.of(context).brightness == Brightness.dark
+              ? Colors.white
+              : Colors.black);
+    final qr = QrCodeView(data: data, size: size, color: fg);
+    if (!_whiteBgQR) return qr;
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: qr,
+    );
+  }
+
+  /// What the share QR encodes: croc's web receive URL, the same one `croc --qr`
+  /// prints, so a phone that scans it lands on the web receiver. Falls back to
+  /// the bare code when the backend cannot supply a URL — the receiving side
+  /// accepts either.
+  String get _qrPayload {
+    final code = _currentPhrase;
+    if (code.isEmpty) return '';
+    final url = coreController.webReceiveUrl(code);
+    return url.isEmpty ? code : url;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.appLocalizations;
+    // Watch for files shared from other apps (warm start)
+    ref.listen<List<String>>(pendingSharedFilesProvider, (prev, next) {
+      if (next.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => _pickUpSharedFiles(),
+        );
+      }
+    });
+
+    return CommonScaffold(
+      appBar: AppBar(
+        titleSpacing: 12,
+        title: SizedBox(
+          height: 36,
+          child: TextField(
+            controller: _codeController,
+            readOnly: _phraseMode != PhraseMode.never,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 1,
+            ),
+            decoration: InputDecoration(
+              hintText: _phraseHint(l10n),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 0,
+              ),
+              isDense: true,
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: IconButton(
+                      icon: const Icon(Icons.qr_code, size: 16),
+                      onPressed: _showQRCode,
+                      padding: EdgeInsets.zero,
+                      tooltip: l10n.generateQRCode,
+                    ),
+                  ),
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: _ClipboardToggleButton(
+                      isPasteMode: _isPhrasePasteMode,
+                      isActive: false,
+                      onTap: _isPhrasePasteMode ? _pastePhrase : _copyPhrase,
+                      onLongPress: () => setState(
+                        () => _isPhrasePasteMode = !_isPhrasePasteMode,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          if (_phase != SendPhase.idle) _buildStatusChip(l10n),
+          const SizedBox(width: 8),
+          FilledButtonWidget(
+            onPressed:
+                _phase == SendPhase.sending || _phase == SendPhase.pending
+                ? _cancelSend
+                : _phase == SendPhase.cancelled
+                ? null
+                : _startSend,
+            text: _phase == SendPhase.sending || _phase == SendPhase.pending
+                ? l10n.cancel
+                : l10n.send,
+            icon: _phase == SendPhase.sending || _phase == SendPhase.pending
+                ? Icons.close
+                : Icons.send,
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: ListView(
+        children: [
+          // Mode toggle
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            child: SegmentedButton<bool>(
+              segments: [
+                ButtonSegment(
+                  value: false,
+                  label: Text(l10n.file),
+                  icon: const Icon(Icons.insert_drive_file),
+                ),
+                ButtonSegment(
+                  value: true,
+                  label: Text(l10n.text),
+                  icon: const Icon(Icons.text_snippet),
+                ),
+              ],
+              selected: {_isTextMode},
+              onSelectionChanged: (v) => setState(() {
+                _isTextMode = v.first;
+                _saveSendPrefs();
+              }),
+            ),
+          ),
+
+          if (_isTextMode) ...[
+            _shakeWrap(
+              1,
+              _buildSection(l10n.text, Icons.text_snippet, [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                  child: FileDropTarget(
+                    enabled: isDesktop,
+                    onFilesDropped: _onTextDrop,
+                    child: TextField(
+                      controller: _textController,
+                      maxLines: 5,
+                      decoration: InputDecoration(
+                        hintText: l10n.textHint,
+                        border: InputBorder.none,
+                        suffixIcon: _ClipboardToggleButton(
+                          isPasteMode: _isPasteMode,
+                          isActive: false,
+                          onTap: _isPasteMode ? _pasteText : _copyText,
+                          onLongPress: () =>
+                              setState(() => _isPasteMode = !_isPasteMode),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      TextButton.icon(
+                        onPressed: _pickTextFile,
+                        icon: const Icon(Icons.add, size: 16),
+                        label: Text(l10n.selectTextFile),
+                      ),
+                      TextButton.icon(
+                        onPressed: _clearText,
+                        icon: const Icon(Icons.clear_all, size: 16),
+                        label: Text(l10n.clear),
+                      ),
+                    ],
+                  ),
+                ),
+              ]),
+            ),
+          ] else ...[
+            _shakeWrap(
+              0,
+              _buildSection(l10n.file, Icons.insert_drive_file, [
+                FileDropTarget(
+                  enabled: isDesktop,
+                  onFilesDropped: _onFileDrop,
+                  onHoverChanged: (over) =>
+                      setState(() => _dragOverFile = over),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_selectedFolder != null)
+                        ListTile(
+                          leading: const Icon(
+                            Icons.folder,
+                            color: Colors.amber,
+                          ),
+                          title: Text(
+                            _selectedFolder!.split(Platform.pathSeparator).last,
+                          ),
+                          subtitle: Text(
+                            _selectedFolder!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: context.textTheme.bodySmall,
+                          ),
+                          trailing: IconButton(
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: () =>
+                                setState(() => _selectedFolder = null),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        )
+                      else if (_selectedFiles.isEmpty)
+                        NullStatusWidget(
+                          message: _dragOverFile
+                              ? l10n.dropToAdd
+                              : l10n.noFiles,
+                          icon: _dragOverFile
+                              ? Icons.cloud_upload
+                              : Icons.cloud_upload_outlined,
+                        )
+                      else
+                        ...List.generate(_selectedFiles.length, (i) {
+                          final f = _selectedFiles[i];
+                          return ListTile(
+                            leading: const Icon(Icons.insert_drive_file),
+                            title: Text(f.name),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  f.size.fileSize,
+                                  style: context.textTheme.bodySmall,
+                                ),
+                                const SizedBox(width: 4),
+                                IconButton(
+                                  icon: const Icon(Icons.close, size: 18),
+                                  onPressed: () => _removeFile(i),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              ],
+                            ),
+                          );
+                        }),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          TextButton.icon(
+                            onPressed: _pickFiles,
+                            icon: const Icon(Icons.add, size: 16),
+                            label: Text(l10n.selectFiles),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton.icon(
+                            onPressed: _pickFolder,
+                            icon: const Icon(Icons.create_new_folder, size: 16),
+                            label: Text(l10n.selectFolder),
+                          ),
+                        ],
+                      ),
+                      TextButton.icon(
+                        onPressed:
+                            _selectedFiles.isNotEmpty || _selectedFolder != null
+                            ? _clearFiles
+                            : null,
+                        icon: const Icon(Icons.clear_all, size: 16),
+                        label: Text(l10n.clear),
+                      ),
+                    ],
+                  ),
+                ),
+              ]),
+            ),
+          ],
+
+          // Transfer options — collapsible (collapsed while sending)
+          ExpansionTile(
+            shape: const Border(),
+            title: Text(l10n.transferOptions),
+            leading: const Icon(Icons.tune),
+            initiallyExpanded: _phase == SendPhase.idle,
+            onExpansionChanged: (_) => setState(() {}),
+            children: [
+              // Phrase mode chips — inline with other settings
+              ListItem(
+                leading: const Icon(Icons.vpn_key),
+                title: Text(l10n.phraseMode),
+                subtitle: Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 4,
+                    children: [
+                      _phraseChip(l10n.defaultLabel, PhraseMode.defaultMode),
+                      _phraseChip(l10n.phraseModeOn, PhraseMode.on),
+                      _phraseChip(l10n.custom, PhraseMode.never),
+                      if (_phraseMode == PhraseMode.never)
+                        SizedBox(
+                          height: 32,
+                          child: IconButton(
+                            icon: const Icon(Icons.refresh, size: 16),
+                            tooltip: l10n.generate,
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            onPressed: _generateCode,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.copy, size: 20),
+                title: Text(l10n.autoCopyPhrase),
+                delegate: SwitchDelegate(
+                  value: _autoCopyPhrase,
+                  onChanged: (v) => setState(() {
+                    _autoCopyPhrase = v;
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.content_paste_go, size: 20),
+                title: Text(l10n.crocClipboard),
+                delegate: SwitchDelegate(
+                  value: _sendConfig.copyCodeToClipboard,
+                  onChanged: (v) => setState(() {
+                    _sendConfig = _sendConfig.copyWith(copyCodeToClipboard: v);
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.qr_code_2, size: 20),
+                title: Text(l10n.whiteBgQR),
+                delegate: SwitchDelegate(
+                  value: _whiteBgQR,
+                  onChanged: (v) => setState(() {
+                    _whiteBgQR = v;
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem(
+                leading: const Icon(Icons.show_chart),
+                title: Text(l10n.encryptionCurve),
+                subtitle: _buildCurveChips(l10n),
+              ),
+              ListItem(
+                leading: const Icon(Icons.swap_calls),
+                title: Text(l10n.transportMode),
+                subtitle: _buildTransportChips(l10n),
+              ),
+              ListItem(
+                leading: const Icon(Icons.tag),
+                title: Text(l10n.hashAlgorithm),
+                subtitle: _buildHashChips(l10n),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.compress),
+                title: Text(l10n.enableCompression),
+                delegate: SwitchDelegate(
+                  value: !_sendConfig.noCompress,
+                  onChanged: (v) => setState(() {
+                    _sendConfig = _sendConfig.copyWith(noCompress: !v);
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.folder_zip),
+                title: Text(l10n.zipFolder),
+                delegate: SwitchDelegate(
+                  value: _sendConfig.zipFolder,
+                  onChanged: (v) => setState(() {
+                    _sendConfig = _sendConfig.copyWith(zipFolder: v);
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.description_outlined),
+                title: Text(l10n.respectGitIgnore),
+                delegate: SwitchDelegate(
+                  value: _sendConfig.gitIgnore,
+                  onChanged: (v) => setState(() {
+                    _sendConfig = _sendConfig.copyWith(gitIgnore: v);
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              ListItem.switchItem(
+                leading: const Icon(Icons.lan_outlined),
+                title: Text(l10n.disableLocalRelay),
+                delegate: SwitchDelegate(
+                  value: _sendConfig.disableLocal,
+                  onChanged: (v) => setState(() {
+                    _sendConfig = _sendConfig.copyWith(disableLocal: v);
+                    _saveSendPrefs();
+                  }),
+                ),
+              ),
+              _optionTextField(
+                icon: Icons.filter_alt_outlined,
+                title: l10n.excludePatterns,
+                hint: l10n.excludePatternsHint,
+                controller: _excludeCtrl,
+                onChanged: (v) {
+                  // croc treats --exclude entries as plain substrings.
+                  final patterns = v
+                      .split(',')
+                      .map((s) => s.trim())
+                      .where((s) => s.isNotEmpty)
+                      .toList();
+                  _sendConfig = _sendConfig.copyWith(exclude: patterns);
+                  _saveSendPrefs();
+                },
+              ),
+              _optionTextField(
+                icon: Icons.speed,
+                title: l10n.throttleUpload,
+                hint: l10n.throttleUploadHint,
+                controller: _throttleCtrl,
+                onChanged: (v) {
+                  _sendConfig = _sendConfig.copyWith(throttleUpload: v.trim());
+                  _saveSendPrefs();
+                },
+              ),
+              _optionTextField(
+                icon: Icons.vpn_lock_outlined,
+                title: l10n.socks5Proxy,
+                hint: l10n.proxyHint,
+                controller: _socks5Ctrl,
+                onChanged: (v) {
+                  _sendConfig = _sendConfig.copyWith(socks5Proxy: v.trim());
+                  _saveSendPrefs();
+                },
+              ),
+              _optionTextField(
+                icon: Icons.language_outlined,
+                title: l10n.httpProxy,
+                hint: l10n.proxyHint,
+                controller: _httpProxyCtrl,
+                onChanged: (v) {
+                  _sendConfig = _sendConfig.copyWith(httpProxy: v.trim());
+                  _saveSendPrefs();
+                },
+              ),
+              ListItem(
+                leading: const Icon(Icons.text_snippet),
+                title: Text(l10n.textSizeLimit),
+                subtitle: Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Row(
+                    children: [
+                      ChoiceChip(
+                        label: Text(
+                          l10n.defaultLabel,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        selected: _textByteLimit == null,
+                        onSelected: (v) {
+                          if (v) {
+                            setState(() {
+                              _textByteLimit = null;
+                              _limitCtrl.clear();
+                              _saveSendPrefs();
+                            });
+                          }
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: Text(
+                          l10n.unlimited,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        selected: _textByteLimit == 0,
+                        onSelected: (v) {
+                          if (v) {
+                            setState(() {
+                              _textByteLimit = 0;
+                              _limitCtrl.clear();
+                              _saveSendPrefs();
+                            });
+                          }
+                        },
+                      ),
+                      const SizedBox(width: 8),
+                      ChoiceChip(
+                        label: Text(
+                          l10n.custom,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                        selected: _textByteLimit != null && _textByteLimit! > 0,
+                        onSelected: (v) {
+                          if (v) {
+                            setState(() {
+                              _textByteLimit = _defaultTextLimit;
+                              _limitCtrl.text = '$_defaultTextLimit';
+                              _saveSendPrefs();
+                            });
+                          }
+                        },
+                      ),
+                      if (_textByteLimit != null && _textByteLimit! > 0) ...[
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 72,
+                          child: TextField(
+                            controller: _limitCtrl,
+                            keyboardType: TextInputType.number,
+                            style: const TextStyle(fontSize: 13),
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 4,
+                              ),
+                              border: OutlineInputBorder(),
+                            ),
+                            onChanged: (v) {
+                              final val = int.tryParse(v);
+                              if (val != null && val > 0) {
+                                _textByteLimit = val;
+                                _saveSendPrefs();
+                                _enforceTextLimit();
+                              }
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        const Text('B', style: TextStyle(fontSize: 12)),
+                        IconButton(
+                          icon: const Icon(Icons.restart_alt, size: 16),
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 28,
+                            minHeight: 28,
+                          ),
+                          tooltip: l10n.reset,
+                          onPressed: () {
+                            setState(() {
+                              _textByteLimit = null;
+                              _limitCtrl.clear();
+                              _saveSendPrefs();
+                            });
+                          },
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+          ),
+
+          if (_qrPayload.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Center(child: _buildQR(_qrPayload, 160)),
+            ),
+
+          const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+
+  void _onTextDrop(List<File> files) {
+    for (final f in files) {
+      if (!FileSystemEntity.isDirectorySync(f.path)) {
+        try {
+          final content = f.readAsStringSync();
+          _textController.text = _applyTextLimit(content);
+          _textController.selection = TextSelection.collapsed(
+            offset: _textController.text.length,
+          );
+          return;
+        } catch (_) {}
+      }
+    }
+  }
+
+  void _onFileDrop(List<File> files) {
+    commonPrint(
+      '_onFileDrop: ${files.length} files, paths=${files.map((f) => f.path).toList()}',
+    );
+    for (final f in files) {
+      final path = f.path.endsWith(Platform.pathSeparator)
+          ? f.path.substring(0, f.path.length - 1)
+          : f.path;
+      if (FileSystemEntity.isDirectorySync(path) ||
+          Directory(path).existsSync()) {
+        setState(() {
+          _selectedFolder = path;
+          _selectedFiles.clear();
+        });
+        return;
+      }
+    }
+    final newFiles = <FileItem>[];
+    for (final f in files) {
+      if (!FileSystemEntity.isDirectorySync(f.path) &&
+          !_selectedFiles.any((s) => s.path == f.path)) {
+        final item = fileItemForPath(f.path);
+        if (item != null) newFiles.add(item);
+      }
+    }
+    if (newFiles.isNotEmpty) setState(() => _selectedFiles.addAll(newFiles));
+  }
+
+  // ── Shake wrapper ──
+
+  Widget _shakeWrap(int target, Widget child) {
+    return AnimatedBuilder(
+      animation: _shakeCtrl.view,
+      builder: (_, child) {
+        final dx = (_shakeTarget == target) ? sin(_shakeAnim.value) * 6 : 0.0;
+        return Transform.translate(offset: Offset(dx, 0), child: child!);
+      },
+      child: child,
+    );
+  }
+
+  // ── Helper methods ──
+
+  String _phraseHint(AppLocalizations l10n) => switch (_phraseMode) {
+    PhraseMode.defaultMode => l10n.phraseHintCroc,
+    PhraseMode.on => l10n.phraseHintRandom,
+    PhraseMode.never => l10n.enterCodePhrase,
+  };
+
+  Widget _phraseChip(String label, PhraseMode mode) => ChoiceChip(
+    label: Text(label),
+    selected: _phraseMode == mode,
+    onSelected: (v) {
+      if (v) {
+        setState(() {
+          _phraseMode = mode;
+          if (mode != PhraseMode.defaultMode) _codeController.clear();
+          _saveSendPrefs();
+        });
+      }
+    },
+  );
+
+  Widget _buildCurveChips(AppLocalizations l10n) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(
+        spacing: 8,
+        children: [
+          ChoiceChip(
+            label: Text(l10n.defaultLabel),
+            selected: _sendConfig.curve == defaultCurve,
+            onSelected: (v) {
+              if (v) {
+                setState(() {
+                  _sendConfig = _sendConfig.copyWith(curve: defaultCurve);
+                  _saveSendPrefs();
+                });
+              }
+            },
+          ),
+          ...availableCurves.where((c) => c != defaultCurve).map((c) {
+            return ChoiceChip(
+              label: Text(c),
+              selected: _sendConfig.curve == c,
+              onSelected: (v) {
+                if (v) {
+                  setState(() {
+                    _sendConfig = _sendConfig.copyWith(curve: c);
+                    _saveSendPrefs();
+                  });
+                }
+              },
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  /// A labelled single-line text field inside a [ListItem] — used for the
+  /// exclude patterns, the upload cap and the proxy addresses.
+  Widget _optionTextField({
+    required IconData icon,
+    required String title,
+    required String hint,
+    required TextEditingController controller,
+    required ValueChanged<String> onChanged,
+  }) {
+    return ListItem(
+      leading: Icon(icon),
+      title: Text(title),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: TextField(
+          controller: controller,
+          style: const TextStyle(fontSize: 13),
+          decoration: InputDecoration(
+            isDense: true,
+            hintText: hint,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 8,
+              vertical: 8,
+            ),
+            border: const OutlineInputBorder(),
+          ),
+          onChanged: onChanged,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTransportChips(AppLocalizations l10n) {
+    // Values must match croc.TransportMode (auto / derp / relay).
+    final options = <String, String>{
+      'auto': l10n.transportAuto,
+      'derp': l10n.transportDerp,
+      'relay': l10n.transportRelay,
+    };
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(
+        spacing: 8,
+        children: options.entries.map((e) {
+          return ChoiceChip(
+            label: Text(e.value),
+            selected: _sendConfig.transport == e.key,
+            onSelected: (v) {
+              if (v) {
+                setState(() {
+                  _sendConfig = _sendConfig.copyWith(transport: e.key);
+                  _saveSendPrefs();
+                });
+              }
+            },
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  Widget _buildHashChips(AppLocalizations l10n) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(
+        spacing: 8,
+        children: [
+          ChoiceChip(
+            label: Text(l10n.defaultLabel),
+            selected: _sendConfig.hashAlgorithm == defaultHashAlgo,
+            onSelected: (v) {
+              if (v) {
+                setState(() {
+                  _sendConfig = _sendConfig.copyWith(
+                    hashAlgorithm: defaultHashAlgo,
+                  );
+                  _saveSendPrefs();
+                });
+              }
+            },
+          ),
+          ...availableHashAlgos.where((h) => h != defaultHashAlgo).map((h) {
+            return ChoiceChip(
+              label: Text(h),
+              selected: _sendConfig.hashAlgorithm == h,
+              onSelected: (v) {
+                if (v) {
+                  setState(() {
+                    _sendConfig = _sendConfig.copyWith(hashAlgorithm: h);
+                    _saveSendPrefs();
+                  });
+                }
+              },
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  /// Secondary text for the progress chip: file counter and live speed,
+  /// e.g. `2/5 · 12.3 MB/s`. Empty until the bridge reports something useful.
+  String _buildProgressDetail() {
+    final parts = <String>[];
+    if (_totalFiles > 1) {
+      final done = _completedFiles.clamp(0, _totalFiles);
+      parts.add('$done/$_totalFiles');
+    }
+    if (_speed > 0) parts.add(_speed.transferSpeed);
+    return parts.join(' · ');
+  }
+
+  Widget _buildStatusChip(AppLocalizations l10n) {
+    final (label, color) = switch (_phase) {
+      SendPhase.pending => (l10n.pending, Colors.orange),
+      SendPhase.sending => (l10n.sending, context.colorScheme.primary),
+      SendPhase.success => (l10n.completed, Colors.green),
+      SendPhase.fail => (l10n.failed, Colors.red),
+      SendPhase.cancelled => (l10n.cancelled, Colors.grey),
+      _ => ('', Colors.transparent),
+    };
+    if (label.isEmpty) return const SizedBox.shrink();
+    if (_phase == SendPhase.sending) {
+      final chip = CapsuleProgressChip(
+        label: label,
+        color: color,
+        progress: _progressRatio,
+        detail: _buildProgressDetail(),
+      );
+      // The chip is too narrow for a file name, so surface it on hover.
+      if (_currentFile.isEmpty) return chip;
+      return Tooltip(message: _currentFile, child: chip);
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 12,
+          color: color,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSection(String title, IconData icon, List<Widget> children) =>
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Icon(icon, size: 18, color: context.colorScheme.primary),
+                const SizedBox(width: 8),
+                Text(
+                  title,
+                  style: context.textTheme.titleSmall?.copyWith(
+                    color: context.colorScheme.primary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          ...children,
+        ],
+      );
+}
+
+/// Animated clipboard button with press animation and long-press paste/copy toggle.
+class const _ClipboardToggleButton({
+  required this.isPasteMode,
+  required this.isActive,
+  required this.onTap,
+  required this.onLongPress,
+}) extends StatefulWidget {
+  final bool isPasteMode;
+  final bool isActive;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  State<_ClipboardToggleButton> createState() => _ClipboardToggleButtonState();
+}
+
+class _ClipboardToggleButtonState() extends State<_ClipboardToggleButton> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onLongPress: widget.isActive ? null : widget.onLongPress,
+      onTapDown: widget.isActive
+          ? null
+          : (_) => setState(() => _pressed = true),
+      onTapUp: widget.isActive ? null : (_) => setState(() => _pressed = false),
+      onTapCancel: () => setState(() => _pressed = false),
+      onTap: widget.isActive
+          ? null
+          : () {
+              widget.onTap();
+              setState(() => _pressed = false);
+            },
+      child: AnimatedScale(
+        scale: _pressed ? 0.75 : 1.0,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeInOut,
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          transitionBuilder: (child, anim) =>
+              ScaleTransition(scale: anim, child: child),
+          child: Icon(
+            key: ValueKey(widget.isPasteMode),
+            widget.isPasteMode ? Icons.content_paste : Icons.content_copy,
+            size: 20,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+enum SendPhase() {
+  idle,
+  pending,
+  sending,
+  success,
+  fail,
+  cancelled,
+}

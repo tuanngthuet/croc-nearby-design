@@ -1,0 +1,152 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'common.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+_TransferRecord _$TransferRecordFromJson(Map<String, dynamic> json) =>
+    _TransferRecord(
+      id: json['id'] as String,
+      direction: $enumDecode(_$TransferDirectionEnumMap, json['direction']),
+      status: $enumDecode(_$TransferStatusEnumMap, json['status']),
+      files: (json['files'] as List<dynamic>)
+          .map((e) => FileItem.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      totalSize: (json['totalSize'] as num).toInt(),
+      transferredSize: (json['transferredSize'] as num?)?.toInt(),
+      startTime: DateTime.parse(json['startTime'] as String),
+      endTime: json['endTime'] == null
+          ? null
+          : DateTime.parse(json['endTime'] as String),
+      codePhrase: json['codePhrase'] as String?,
+      relayAddress: json['relayAddress'] as String?,
+      speed: (json['speed'] as num?)?.toDouble(),
+    );
+
+Map<String, dynamic> _$TransferRecordToJson(_TransferRecord instance) =>
+    <String, dynamic>{
+      'id': instance.id,
+      'direction': _$TransferDirectionEnumMap[instance.direction]!,
+      'status': _$TransferStatusEnumMap[instance.status]!,
+      'files': instance.files,
+      'totalSize': instance.totalSize,
+      'transferredSize': instance.transferredSize,
+      'startTime': instance.startTime.toIso8601String(),
+      'endTime': instance.endTime?.toIso8601String(),
+      'codePhrase': instance.codePhrase,
+      'relayAddress': instance.relayAddress,
+      'speed': instance.speed,
+    };
+
+const _$TransferDirectionEnumMap = {
+  TransferDirection.sent: 'sent',
+  TransferDirection.received: 'received',
+};
+
+const _$TransferStatusEnumMap = {
+  TransferStatus.pending: 'pending',
+  TransferStatus.transferring: 'transferring',
+  TransferStatus.completed: 'completed',
+  TransferStatus.failed: 'failed',
+  TransferStatus.cancelled: 'cancelled',
+};
+
+_FileItem _$FileItemFromJson(Map<String, dynamic> json) => _FileItem(
+  name: json['name'] as String,
+  path: json['path'] as String,
+  size: (json['size'] as num).toInt(),
+  folder: json['folder'] as String?,
+);
+
+Map<String, dynamic> _$FileItemToJson(_FileItem instance) => <String, dynamic>{
+  'name': instance.name,
+  'path': instance.path,
+  'size': instance.size,
+  'folder': instance.folder,
+};
+
+_RelayConfig _$RelayConfigFromJson(Map<String, dynamic> json) => _RelayConfig(
+  address: json['address'] as String? ?? defaultRelay,
+  password: json['password'] as String? ?? defaultPassphrase,
+  port: json['port'] as String? ?? defaultPort,
+  type:
+      $enumDecodeNullable(_$RelayTypeEnumMap, json['type']) ??
+      RelayType.defaultRelay,
+);
+
+Map<String, dynamic> _$RelayConfigToJson(_RelayConfig instance) =>
+    <String, dynamic>{
+      'address': instance.address,
+      'password': instance.password,
+      'port': instance.port,
+      'type': _$RelayTypeEnumMap[instance.type]!,
+    };
+
+const _$RelayTypeEnumMap = {
+  RelayType.defaultRelay: 'defaultRelay',
+  RelayType.customRelay: 'customRelay',
+  RelayType.noRelay: 'noRelay',
+};
+
+_SendConfig _$SendConfigFromJson(Map<String, dynamic> json) => _SendConfig(
+  curve: json['curve'] as String? ?? defaultCurve,
+  hashAlgorithm: json['hashAlgorithm'] as String? ?? defaultHashAlgorithm,
+  noCompress: json['noCompress'] as bool? ?? false,
+  overwrite: json['overwrite'] as bool? ?? false,
+  zipFolder: json['zipFolder'] as bool? ?? false,
+  gitIgnore: json['gitIgnore'] as bool? ?? false,
+  onlyLocal: json['onlyLocal'] as bool? ?? false,
+  disableLocal: json['disableLocal'] as bool? ?? false,
+  showQrCode: json['showQrCode'] as bool? ?? false,
+  copyCodeToClipboard: json['copyCodeToClipboard'] as bool? ?? false,
+  codePhrase: json['codePhrase'] as String? ?? '',
+  socks5Proxy: json['socks5Proxy'] as String? ?? '',
+  httpProxy: json['httpProxy'] as String? ?? '',
+  throttleUpload: json['throttleUpload'] as String? ?? '',
+  exclude:
+      (json['exclude'] as List<dynamic>?)?.map((e) => e as String).toList() ??
+      const <String>[],
+  transport: json['transport'] as String? ?? 'auto',
+);
+
+Map<String, dynamic> _$SendConfigToJson(_SendConfig instance) =>
+    <String, dynamic>{
+      'curve': instance.curve,
+      'hashAlgorithm': instance.hashAlgorithm,
+      'noCompress': instance.noCompress,
+      'overwrite': instance.overwrite,
+      'zipFolder': instance.zipFolder,
+      'gitIgnore': instance.gitIgnore,
+      'onlyLocal': instance.onlyLocal,
+      'disableLocal': instance.disableLocal,
+      'showQrCode': instance.showQrCode,
+      'copyCodeToClipboard': instance.copyCodeToClipboard,
+      'codePhrase': instance.codePhrase,
+      'socks5Proxy': instance.socks5Proxy,
+      'httpProxy': instance.httpProxy,
+      'throttleUpload': instance.throttleUpload,
+      'exclude': instance.exclude,
+      'transport': instance.transport,
+    };
+
+_ReceiveConfig _$ReceiveConfigFromJson(Map<String, dynamic> json) =>
+    _ReceiveConfig(
+      overwrite: json['overwrite'] as bool? ?? false,
+      rename: json['rename'] as bool? ?? true,
+      onlyLocal: json['onlyLocal'] as bool? ?? false,
+      outputPath: json['outputPath'] as String? ?? '',
+      socks5Proxy: json['socks5Proxy'] as String? ?? '',
+      httpProxy: json['httpProxy'] as String? ?? '',
+    );
+
+Map<String, dynamic> _$ReceiveConfigToJson(_ReceiveConfig instance) =>
+    <String, dynamic>{
+      'overwrite': instance.overwrite,
+      'rename': instance.rename,
+      'onlyLocal': instance.onlyLocal,
+      'outputPath': instance.outputPath,
+      'socks5Proxy': instance.socks5Proxy,
+      'httpProxy': instance.httpProxy,
+    };

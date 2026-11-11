@@ -1,0 +1,5 @@
+[submodule "submodules/croc"]
+	path = submodules/croc
+	url = https://github.com/576576/croc.git
+	branch = flcroc
+

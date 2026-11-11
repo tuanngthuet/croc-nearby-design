@@ -1,0 +1,1239 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:fl_croc/common/common.dart';
+import 'package:fl_croc/controller.dart';
+import 'package:fl_croc/core/controller.dart';
+import 'package:fl_croc/enum/enum.dart';
+import 'package:fl_croc/l10n/l10n.dart';
+import 'package:fl_croc/models/models.dart';
+import 'package:fl_croc/providers/providers.dart';
+import 'package:fl_croc/state.dart';
+import 'package:fl_croc/widgets/widgets.dart';
+import 'package:fl_croc/widgets/native_qr_scanner.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class const ReceiveView({super.key}) extends ConsumerStatefulWidget {
+  @override
+  ConsumerState<ReceiveView> createState() => _ReceiveViewState();
+}
+
+class _ReceiveViewState() extends ConsumerState<ReceiveView> {
+  final _codeController = TextEditingController();
+  final _scrollCtrl = ScrollController();
+  bool _isReceiving = false;
+  ReceiveConfig _receiveConfig = const ReceiveConfig();
+
+  // Proxy addresses (croc --socks5 / --connect).
+  final _socks5Ctrl = TextEditingController();
+  final _httpProxyCtrl = TextEditingController();
+
+  ReceivePhase _phase = ReceivePhase.idle;
+
+  // Live progress reported by the bridge (type-1 events, see CoreLib._liveProgress).
+  double _progress = 0;
+  double _speed = 0;
+  int _completedFiles = 0;
+  int _totalFiles = 0;
+  String _currentFile = '';
+  StreamSubscription<TransferProgress>? _receiveSub;
+
+  void _resetProgress() {
+    _progress = 0;
+    _speed = 0;
+    _completedFiles = 0;
+    _totalFiles = 0;
+    _currentFile = '';
+  }
+
+  DateTime? _lastRecordPersist;
+  static const _recordPersistInterval = Duration(seconds: 1);
+
+  /// `updateTransferRecord` writes the history to prefs, so during a transfer
+  /// (progress events every 200ms) only persist about once a second.
+  bool _shouldPersistRecord() {
+    final now = DateTime.now();
+    final last = _lastRecordPersist;
+    if (last != null && now.difference(last) < _recordPersistInterval) {
+      return false;
+    }
+    _lastRecordPersist = now;
+    return true;
+  }
+
+  /// Secondary text for the progress chip, e.g. `2/5 · 12.3 MB/s`.
+  String _buildProgressDetail() {
+    final parts = <String>[];
+    if (_totalFiles > 1) {
+      final done = _completedFiles.clamp(0, _totalFiles);
+      parts.add('$done/$_totalFiles');
+    }
+    if (_speed > 0) parts.add(_speed.transferSpeed);
+    return parts.join(' · ');
+  }
+
+  final List<FileItem> _receivedFiles = [];
+  int _selectedTab = 0; // 0=files, 1=text
+  bool _isPasteMode = false; // receive: default copy
+  bool _isPhrasePasteMode = true; // phrase field: default paste
+  final _receivedTextController = TextEditingController();
+  String _effectiveOutputPath = '';
+
+  // Persist code phrase across page switches
+  static String _savedCodePhrase = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadReceivePrefs();
+    if (_savedCodePhrase.isNotEmpty) {
+      _codeController.text = _savedCodePhrase;
+    }
+  }
+
+  // ── Persistence ──
+
+  void _loadReceivePrefs() {
+    _receiveConfig = ReceiveConfig.load();
+    _socks5Ctrl.text = _receiveConfig.socks5Proxy;
+    _httpProxyCtrl.text = _receiveConfig.httpProxy;
+  }
+
+  void _saveReceivePrefs() {
+    _receiveConfig.save();
+  }
+
+  /// A labelled single-line text field inside a [ListItem], used for the
+  /// proxy addresses.
+  Widget _optionTextField({
+    required IconData icon,
+    required String title,
+    required String hint,
+    required TextEditingController controller,
+    required ValueChanged<String> onChanged,
+  }) {
+    return ListItem(
+      leading: Icon(icon),
+      title: Text(title),
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: TextField(
+          controller: controller,
+          style: const TextStyle(fontSize: 13),
+          decoration: InputDecoration(
+            isDense: true,
+            hintText: hint,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 8,
+              vertical: 8,
+            ),
+            border: const OutlineInputBorder(),
+          ),
+          onChanged: onChanged,
+        ),
+      ),
+    );
+  }
+
+  /// Build FileItem list from received file names, detecting folders.
+  List<FileItem> _buildFileItems(List<String> fileNames, int totalSize) {
+    if (fileNames.isEmpty) {
+      return [FileItem(name: 'file', path: _effectiveOutputPath, size: 0)];
+    }
+    if (fileNames.length > 1) {
+      final separator = fileNames[0].contains('/')
+          ? '/'
+          : (fileNames[0].contains('\\') ? '\\' : null);
+      String? commonRoot;
+      if (separator != null) {
+        final root = fileNames[0].split(separator)[0];
+        if (fileNames.every((n) => n.startsWith('$root$separator'))) {
+          commonRoot = root;
+        }
+      }
+      if (commonRoot != null) {
+        return [
+          FileItem(
+            name: commonRoot,
+            path: '$_effectiveOutputPath${Platform.pathSeparator}$commonRoot',
+            size: totalSize,
+          ),
+        ];
+      }
+      return fileNames
+          .map(
+            (n) => FileItem(
+              name: n,
+              path:
+                  '$_effectiveOutputPath${Platform.pathSeparator}${n.replaceAll('/', Platform.pathSeparator)}',
+              size: totalSize,
+            ),
+          )
+          .toList();
+    }
+    final name = fileNames[0];
+    return [
+      FileItem(
+        name: name,
+        path: '$_effectiveOutputPath${Platform.pathSeparator}$name',
+        size: totalSize,
+      ),
+    ];
+  }
+
+  void _openScanner() async {
+    if (isDesktop) {
+      if (mounted) {
+        context.showSnackBar(context.appLocalizations.scanMobileOnly);
+      }
+      return;
+    }
+    try {
+      final result = await Navigator.of(
+        context,
+      ).push<String>(_QrScannerRoute(builder: (_) => const _QRScannerDialog()));
+      if (result != null && mounted) {
+        _codeController.text = normalizeShareCode(result);
+      }
+    } catch (e, st) {
+      commonPrint('Scanner dialog error: $e\n$st');
+      if (mounted) {
+        context.showSnackBar(
+          context.appLocalizations.localizeCrocError(e.toString()),
+        );
+      }
+    }
+  }
+
+  void _pastePhrase() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (data?.text != null && data!.text!.isNotEmpty) {
+      _codeController.text = normalizeShareCode(data.text!);
+      if (mounted) context.showSnackBar(context.appLocalizations.codePasted);
+    }
+  }
+
+  void _copyPhrase() {
+    final p = _codeController.text.trim();
+    if (p.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: p));
+    if (mounted) context.showSnackBar(context.appLocalizations.codeCopied);
+  }
+
+  String _defaultDownloadDir() => AppPaths.savePathSync;
+
+  Future<void> _pickReceivePath() async {
+    final result = await FilePicker.getDirectoryPath();
+    if (result != null && mounted) {
+      setState(() {
+        _receiveConfig = _receiveConfig.copyWith(outputPath: result);
+        _saveReceivePrefs();
+      });
+    }
+  }
+
+  void _startReceive() {
+    final code = normalizeShareCode(_codeController.text);
+    final l10n = context.appLocalizations;
+    if (code.isEmpty) {
+      context.showSnackBar(l10n.phraseEmpty);
+      return;
+    }
+
+    if (!coreController.isAvailable) {
+      context.showSnackBar(l10n.noCrocBackend);
+      return;
+    }
+
+    setState(() {
+      _isReceiving = true;
+      _phase = ReceivePhase.pending;
+      _resetProgress();
+      _receivedFiles.clear();
+      _receivedTextController.clear();
+      _selectedTab = 0;
+    });
+
+    final record = TransferRecord(
+      id: appController.generateId(),
+      direction: TransferDirection.received,
+      status: TransferStatus.transferring,
+      files: [FileItem(name: l10n.receiving, path: '', size: 0)],
+      totalSize: 0,
+      startTime: DateTime.now(),
+      codePhrase: code,
+    );
+
+    appController.addTransferRecord(record);
+
+    final relayConfig = ref.read(appSettingProvider).relayConfig;
+    final useNoRelay = relayConfig.type == RelayType.noRelay;
+    final useCustom = relayConfig.type == RelayType.customRelay;
+
+    final effectivePath = _receiveConfig.outputPath.isNotEmpty
+        ? _receiveConfig.outputPath
+        : (ref.read(appSettingProvider).defaultSavePath.isNotEmpty
+              ? ref.read(appSettingProvider).defaultSavePath
+              : _defaultDownloadDir());
+    _effectiveOutputPath = effectivePath;
+
+    final options = ReceiveOptions(
+      codePhrase: code,
+      overwrite: _receiveConfig.overwrite,
+      rename: _receiveConfig.rename,
+      socks5Proxy: _receiveConfig.socks5Proxy,
+      httpProxy: _receiveConfig.httpProxy,
+      onlyLocal: useNoRelay,
+      outputPath: effectivePath,
+      relayAddress: useCustom ? relayConfig.address : null,
+      relayPassword: useCustom ? relayConfig.password : null,
+      relayPorts: useCustom ? relayConfig.port : null,
+    );
+
+    _receiveSub = coreController
+        .receiveFiles(options)
+        .listen(
+          (progress) {
+            if (!mounted) return;
+            switch (progress.status) {
+              case TransferProgressStatus.initializing:
+              case TransferProgressStatus.connecting:
+                // Still [ReceivePhase.pending] ("waiting") until the bridge
+                // reports that the sender has joined.
+                break;
+              case TransferProgressStatus.transferring:
+                if (_phase == ReceivePhase.pending) {
+                  setState(() {
+                    _phase = ReceivePhase.receiving;
+                    _resetProgress();
+                  });
+                }
+                setState(() {
+                  if (progress.totalSize > 0) {
+                    _progress = (progress.transferredSize / progress.totalSize)
+                        .clamp(0.0, 1.0);
+                  }
+                  if (progress.totalFiles > 0) {
+                    _totalFiles = progress.totalFiles;
+                  }
+                  _completedFiles = progress.completedFiles;
+                  if (progress.currentFile.isNotEmpty) {
+                    _currentFile = progress.currentFile;
+                  }
+                  if (progress.speed > 0) _speed = progress.speed;
+                });
+                appController.setSpeed(record.id, progress.speed);
+                // Persisting the record writes prefs, so throttle it while the
+                // bridge reports every 200ms.
+                if (_shouldPersistRecord()) {
+                  appController.updateTransferRecord(
+                    record.copyWith(
+                      status: TransferStatus.transferring,
+                      transferredSize: progress.transferredSize,
+                    ),
+                  );
+                }
+                break;
+              case TransferProgressStatus.completed:
+                appController.setSpeed(record.id, 0);
+                setState(() {
+                  _progress = 1;
+                  _completedFiles = _totalFiles;
+                  _speed = 0;
+                  _phase = ReceivePhase.completed;
+                });
+                if (progress.isText) {
+                  setState(() {
+                    _receivedFiles.clear();
+                    _selectedTab = 1;
+                    _isReceiving = false;
+                  });
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted) return;
+                    _receivedTextController
+                      ..text = progress.textContent
+                      ..selection = TextSelection.collapsed(
+                        offset: progress.textContent.length,
+                      );
+                  });
+                  appController.updateTransferRecord(
+                    record.copyWith(
+                      status: TransferStatus.completed,
+                      totalSize: progress.textContent.length,
+                      files: [
+                        FileItem(
+                          name: progress.textContent,
+                          path: '',
+                          size: progress.textContent.length,
+                        ),
+                      ],
+                      endTime: DateTime.now(),
+                    ),
+                  );
+                } else {
+                  final fileNames = progress.currentFile.isNotEmpty
+                      ? progress.currentFile
+                            .split('\n')
+                            .where((n) => n.isNotEmpty)
+                            .toList()
+                      : <String>[];
+                  final cleanedNames = fileNames.map((n) {
+                    if (fileNames.length == 1 && n.endsWith('.zip')) {
+                      return n.substring(0, n.length - 4);
+                    }
+                    return n;
+                  }).toList();
+                  final fileItems = _buildFileItems(
+                    cleanedNames,
+                    progress.totalSize,
+                  );
+                  setState(() {
+                    _receivedFiles.clear();
+                    _receivedFiles.addAll(fileItems);
+                    _receivedTextController.clear();
+                    _selectedTab = fileItems.isNotEmpty ? 0 : _selectedTab;
+                    _isReceiving = false;
+                  });
+                  if (fileItems.isNotEmpty && isAndroid) {
+                    for (final f in fileItems) {
+                      AppPaths.exportToDownloads(f.path);
+                    }
+                  }
+                  appController.updateTransferRecord(
+                    record.copyWith(
+                      status: TransferStatus.completed,
+                      transferredSize: progress.totalSize,
+                      totalSize: progress.totalSize,
+                      files: fileItems.isEmpty
+                          ? [const FileItem(name: 'file', path: '', size: 0)]
+                          : fileItems,
+                      endTime: DateTime.now(),
+                    ),
+                  );
+                }
+              case TransferProgressStatus.failed:
+                appController.setSpeed(record.id, 0);
+                setState(() {
+                  _isReceiving = false;
+                  _phase = ReceivePhase.failed;
+                });
+                appController.updateTransferRecord(
+                  record.copyWith(
+                    status: TransferStatus.failed,
+                    files: [
+                      FileItem(name: l10n.receiveFailed, path: '', size: 0),
+                    ],
+                    endTime: DateTime.now(),
+                  ),
+                );
+                if (progress.error != null && mounted) {
+                  commonPrint('Receive failed: ${progress.error}');
+                  final errMsg = progress.error == CoreController.noBackendError
+                      ? l10n.noCrocBackend
+                      : l10n.localizeCrocError(progress.error!);
+                  context.showSnackBar(errMsg);
+                }
+              case TransferProgressStatus.cancelled:
+                appController.setSpeed(record.id, 0);
+                setState(() {
+                  _isReceiving = false;
+                  _phase = ReceivePhase.cancelled;
+                });
+                appController.updateTransferRecord(
+                  record.copyWith(
+                    status: TransferStatus.cancelled,
+                    endTime: DateTime.now(),
+                  ),
+                );
+            }
+          },
+          onError: (e) {
+            if (!mounted) return;
+            final l10n = context.appLocalizations;
+            setState(() => _isReceiving = false);
+            appController.updateTransferRecord(
+              record.copyWith(
+                status: TransferStatus.failed,
+                files: [FileItem(name: l10n.receiveFailed, path: '', size: 0)],
+                endTime: DateTime.now(),
+              ),
+            );
+            final errMsg = e.toString() == 'UnsupportedError: unavailable'
+                ? l10n.noCrocBackend
+                : l10n.localizeCrocError(e.toString());
+            context.showSnackBar(errMsg);
+            commonPrint('Receive error: $e');
+          },
+          onDone: () {
+            if (mounted) setState(() => _isReceiving = false);
+          },
+        );
+  }
+
+  void _cancelReceive() {
+    _receiveSub?.cancel();
+    _receiveSub = null;
+    setState(() {
+      _isReceiving = false;
+      _phase = ReceivePhase.cancelled;
+    });
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted) setState(() => _phase = ReceivePhase.idle);
+    });
+  }
+
+  @override
+  void dispose() {
+    _savedCodePhrase = _codeController.text;
+    _receiveSub?.cancel();
+    _saveReceivePrefs();
+    _codeController.dispose();
+    _receivedTextController.dispose();
+    _scrollCtrl.dispose();
+    _socks5Ctrl.dispose();
+    _httpProxyCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.appLocalizations;
+    return CommonScaffold(
+      appBar: AppBar(
+        titleSpacing: 12,
+        title: SizedBox(
+          height: 36,
+          child: TextField(
+            controller: _codeController,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 14, letterSpacing: 1),
+            decoration: InputDecoration(
+              hintText: l10n.enterCodePhrase,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 0,
+              ),
+              isDense: true,
+              suffixIcon: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: IconButton(
+                      icon: const Icon(Icons.qr_code_scanner, size: 16),
+                      onPressed: _openScanner,
+                      padding: EdgeInsets.zero,
+                      tooltip: l10n.scanQRCode,
+                    ),
+                  ),
+                  SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: _ClipboardToggleButton(
+                      isPasteMode: _isPhrasePasteMode,
+                      isActive: false,
+                      onTap: _isPhrasePasteMode ? _pastePhrase : _copyPhrase,
+                      onLongPress: () => setState(
+                        () => _isPhrasePasteMode = !_isPhrasePasteMode,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          if (_phase != ReceivePhase.idle) _buildStatusChip(l10n),
+          const SizedBox(width: 8),
+          FilledButtonWidget(
+            onPressed: _isReceiving
+                ? _cancelReceive
+                : _phase == ReceivePhase.cancelled
+                ? null
+                : _startReceive,
+            text: _isReceiving ? l10n.cancel : l10n.receive,
+            icon: _isReceiving ? Icons.close : Icons.download,
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: ScrollConfiguration(
+        behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+        child: ListView(
+          controller: _scrollCtrl,
+          children: [
+            // ── File / Text toggle (always visible, matches send page) ──
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              child: SegmentedButton<int>(
+                segments: [
+                  ButtonSegment(
+                    value: 0,
+                    label: Text(l10n.file),
+                    icon: const Icon(Icons.insert_drive_file, size: 18),
+                  ),
+                  ButtonSegment(
+                    value: 1,
+                    label: Text(l10n.text),
+                    icon: const Icon(Icons.text_snippet, size: 18),
+                  ),
+                ],
+                selected: {_selectedTab},
+                onSelectionChanged: (v) =>
+                    setState(() => _selectedTab = v.first),
+              ),
+            ),
+
+            // ── Received content (matches send page layout / behavior) ──
+            if (_selectedTab == 0)
+              _buildSection(l10n.file, Icons.insert_drive_file, [
+                if (_receivedFiles.isEmpty)
+                  NullStatusWidget(
+                    message: l10n.noReceivedFiles,
+                    icon: Icons.inbox_outlined,
+                  )
+                else
+                  ..._receivedFiles.map((f) {
+                    final showAsFolder =
+                        f.name.contains('/') ||
+                        (_receivedFiles.length == 1 && !f.name.contains('.'));
+                    return ListTile(
+                      leading: Icon(
+                        showAsFolder ? Icons.folder : Icons.insert_drive_file,
+                        color: showAsFolder ? Colors.amber : null,
+                      ),
+                      title: Text(
+                        f.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: f.size > 0
+                          ? Text(
+                              f.size.fileSize,
+                              style: context.textTheme.bodySmall,
+                            )
+                          : null,
+                      dense: true,
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.folder_open, size: 18),
+                            onPressed: () => globalState.openFolder(f.path),
+                            tooltip: l10n.openFolder,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.open_in_new, size: 18),
+                            onPressed: () => showAsFolder
+                                ? globalState.openFolder(f.path)
+                                : globalState.openFile(f.path),
+                            tooltip: l10n.open,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: _receivedFiles.isNotEmpty
+                          ? () {
+                              setState(() => _receivedFiles.clear());
+                              context.showSnackBar(l10n.cleared);
+                            }
+                          : null,
+                      icon: const Icon(Icons.clear_all, size: 16),
+                      label: Text(l10n.clear),
+                    ),
+                  ),
+                ),
+              ])
+            else
+              _buildSection(l10n.text, Icons.text_snippet, [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                  child: TextField(
+                    controller: _receivedTextController,
+                    readOnly: true,
+                    maxLines: 5,
+                    decoration: InputDecoration(
+                      hintText: l10n.textHint,
+                      border: InputBorder.none,
+                      suffixIcon: _ClipboardToggleButton(
+                        isPasteMode: _isPasteMode,
+                        isActive: false,
+                        onTap: _isPasteMode
+                            ? () async {
+                                final data = await Clipboard.getData(
+                                  Clipboard.kTextPlain,
+                                );
+                                if (data?.text != null &&
+                                    data!.text!.isNotEmpty) {
+                                  setState(
+                                    () => _receivedTextController.text =
+                                        data.text!,
+                                  );
+                                  if (context.mounted) {
+                                    context.showSnackBar(l10n.pasted);
+                                  }
+                                }
+                              }
+                            : () {
+                                if (_receivedTextController.text.isNotEmpty) {
+                                  Clipboard.setData(
+                                    ClipboardData(
+                                      text: _receivedTextController.text,
+                                    ),
+                                  );
+                                  context.showSnackBar(l10n.copied);
+                                }
+                              },
+                        onLongPress: () =>
+                            setState(() => _isPasteMode = !_isPasteMode),
+                      ),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const SizedBox(width: 1),
+                      TextButton.icon(
+                        onPressed: _receivedTextController.text.isNotEmpty
+                            ? () {
+                                setState(() => _receivedTextController.clear());
+                                context.showSnackBar(l10n.cleared);
+                              }
+                            : null,
+                        icon: const Icon(Icons.clear_all, size: 16),
+                        label: Text(l10n.clear),
+                      ),
+                    ],
+                  ),
+                ),
+              ]),
+
+            // ── Options ──
+            ExpansionTile(
+              shape: const Border(),
+              title: Text(l10n.transferOptions),
+              leading: const Icon(Icons.tune),
+              initiallyExpanded: _phase == ReceivePhase.idle,
+              onExpansionChanged: (_) => setState(() {}),
+              children: [
+                ListItem.switchItem(
+                  leading: const Icon(Icons.file_copy),
+                  title: Text(l10n.overwrite),
+                  delegate: SwitchDelegate(
+                    value: _receiveConfig.overwrite,
+                    onChanged: (v) {
+                      setState(() {
+                        _receiveConfig = _receiveConfig.copyWith(overwrite: v);
+                        _saveReceivePrefs();
+                      });
+                    },
+                  ),
+                ),
+                ListItem.switchItem(
+                  leading: const Icon(Icons.drive_file_rename_outline),
+                  title: Text(l10n.renameOnCollision),
+                  delegate: SwitchDelegate(
+                    value: _receiveConfig.rename,
+                    onChanged: (v) {
+                      setState(() {
+                        _receiveConfig = _receiveConfig.copyWith(rename: v);
+                        _saveReceivePrefs();
+                      });
+                    },
+                  ),
+                ),
+                Consumer(
+                  builder: (_, ref, c) {
+                    final isCustom = _receiveConfig.outputPath.isNotEmpty;
+                    final globalPath = ref.watch(
+                      appSettingProvider.select((s) => s.defaultSavePath),
+                    );
+                    final effectivePath = isCustom
+                        ? _receiveConfig.outputPath
+                        : (globalPath.isNotEmpty
+                              ? globalPath
+                              : _defaultDownloadDir());
+                    return ListItem(
+                      leading: const Icon(Icons.folder),
+                      title: Text(l10n.savePath),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              ChoiceChip(
+                                label: Text(
+                                  l10n.defaultLabel,
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                                selected: !isCustom,
+                                onSelected: (v) {
+                                  if (v) {
+                                    setState(() {
+                                      _receiveConfig = _receiveConfig.copyWith(
+                                        outputPath: '',
+                                      );
+                                      _saveReceivePrefs();
+                                    });
+                                  }
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              ChoiceChip(
+                                label: Text(
+                                  l10n.custom,
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                                selected: isCustom,
+                                onSelected: (v) {
+                                  if (v && _receiveConfig.outputPath.isEmpty) {
+                                    setState(() {
+                                      _receiveConfig = _receiveConfig.copyWith(
+                                        outputPath: effectivePath,
+                                      );
+                                      _saveReceivePrefs();
+                                    });
+                                  }
+                                },
+                              ),
+                              if (isCustom) ...[
+                                const SizedBox(width: 4),
+                                IconButton(
+                                  icon: const Icon(Icons.folder_open, size: 18),
+                                  visualDensity: VisualDensity.compact,
+                                  tooltip: l10n.selectFolder,
+                                  onPressed: _pickReceivePath,
+                                ),
+                              ],
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            formatPathForDisplay(
+                              effectivePath,
+                              storageLabel: l10n.storageFolder,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: context.textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+                _optionTextField(
+                  icon: Icons.vpn_lock_outlined,
+                  title: l10n.socks5Proxy,
+                  hint: l10n.proxyHint,
+                  controller: _socks5Ctrl,
+                  onChanged: (v) {
+                    _receiveConfig = _receiveConfig.copyWith(
+                      socks5Proxy: v.trim(),
+                    );
+                    _saveReceivePrefs();
+                  },
+                ),
+                _optionTextField(
+                  icon: Icons.language_outlined,
+                  title: l10n.httpProxy,
+                  hint: l10n.proxyHint,
+                  controller: _httpProxyCtrl,
+                  onChanged: (v) {
+                    _receiveConfig = _receiveConfig.copyWith(
+                      httpProxy: v.trim(),
+                    );
+                    _saveReceivePrefs();
+                  },
+                ),
+                const SizedBox(height: 12),
+              ],
+            ),
+
+            const SizedBox(height: 32),
+          ],
+        ),
+      ), // ScrollConfiguration
+    ); // CommonScaffold
+  }
+
+  Widget _buildStatusChip(AppLocalizations l10n) {
+    final (label, color) = switch (_phase) {
+      ReceivePhase.pending => (l10n.pending, Colors.orange),
+      ReceivePhase.receiving => (l10n.receiving, context.colorScheme.primary),
+      ReceivePhase.completed => (l10n.completed, Colors.green),
+      ReceivePhase.failed => (l10n.failed, Colors.red),
+      ReceivePhase.cancelled => (l10n.cancelled, Colors.grey),
+      _ => ('', Colors.transparent),
+    };
+    if (label.isEmpty) return const SizedBox.shrink();
+    if (_phase == ReceivePhase.receiving) {
+      final chip = CapsuleProgressChip(
+        label: label,
+        color: color,
+        progress: _progress,
+        detail: _buildProgressDetail(),
+      );
+      // The chip is too narrow for a file name, so surface it on hover.
+      if (_currentFile.isEmpty) return chip;
+      return Tooltip(message: _currentFile, child: chip);
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 12,
+          color: color,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSection(String title, IconData icon, List<Widget> children) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: context.colorScheme.primary),
+              const SizedBox(width: 8),
+              Text(
+                title,
+                style: context.textTheme.titleSmall?.copyWith(
+                  color: context.colorScheme.primary,
+                ),
+              ),
+            ],
+          ),
+        ),
+        ...children,
+      ],
+    );
+  }
+}
+
+/// Transparent route with vertical slide transition.
+/// Scanner slides up from bottom on enter, slides up out of view on exit.
+/// The receive page beneath slides up from below when scanner is dismissed.
+class _QrScannerRoute<T>({required this.builder}) extends PageRoute<T> {
+  final WidgetBuilder builder;
+
+  @override
+  Color? get barrierColor => Colors.black87;
+  @override
+  bool get barrierDismissible => false;
+  @override
+  String? get barrierLabel => 'Close';
+  @override
+  bool get maintainState => true;
+  @override
+  Duration get transitionDuration => const Duration(milliseconds: 300);
+
+  @override
+  Widget buildPage(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+  ) {
+    return builder(context);
+  }
+
+  @override
+  Widget buildTransitions(
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    // Scanner: slide down from top on enter, slide up to top on exit
+    final slideAnim = Tween<Offset>(
+      begin: const Offset(0, -1),
+      end: Offset.zero,
+    ).chain(CurveTween(curve: Curves.easeOutCubic));
+
+    // Receive page beneath: slide up from below when scanner is dismissed
+    final secondarySlide = Tween<Offset>(
+      begin: const Offset(0, 0.3),
+      end: Offset.zero,
+    ).chain(CurveTween(curve: Curves.easeOutCubic));
+
+    return SlideTransition(
+      position: secondarySlide.animate(secondaryAnimation),
+      child: SlideTransition(
+        position: slideAnim.animate(animation),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// QR scanner dialog — full-screen Scaffold with camera filling the body.
+class const _QRScannerDialog() extends StatefulWidget {
+  @override
+  State<_QRScannerDialog> createState() => _QRScannerDialogState();
+}
+
+class _QRScannerDialogState() extends State<_QRScannerDialog> {
+  bool _hasScanned = false;
+  bool _isDisposed = false;
+
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    _isDisposed = true;
+    super.dispose();
+  }
+
+  void _onDetect(String code) {
+    if (_hasScanned || _isDisposed) return;
+    _hasScanned = true;
+    Navigator.of(context).pop(code);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.appLocalizations;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        onVerticalDragEnd: (details) {
+          if (details.primaryVelocity != null &&
+              details.primaryVelocity! < -500) {
+            Navigator.of(context).pop();
+          }
+        },
+        child: SafeArea(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              // Camera view — native CameraX+ZXing on Android, mobile_scanner fallback
+              NativeQrScanner(
+                onDetect: _onDetect,
+                errorBuilder: (context, error) {
+                  // Map native error codes to localized messages
+                  final message = switch (error) {
+                    'permissionDenied' => l10n.cameraPermissionDenied,
+                    'unsupported' => l10n.cameraUnsupported,
+                    _ => '${l10n.cameraError}: $error',
+                  };
+                  commonPrint('QR scanner error: $message ($error)');
+                  return Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.error_outline,
+                          size: 48,
+                          color: Colors.white70,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          message,
+                          style: const TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+              // Scanning overlay — subtle animated indicator
+              if (!_hasScanned) const _ScanOverlay(),
+              Positioned(
+                bottom: 16,
+                left: 0,
+                right: 0,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close, size: 18),
+                      label: Text(l10n.cancel),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        side: const BorderSide(color: Colors.white54),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Subtle scanning indicator overlay — animated corner brackets.
+class const _ScanOverlay() extends StatefulWidget {
+  @override
+  State<_ScanOverlay> createState() => _ScanOverlayState();
+}
+
+class _ScanOverlayState()
+    extends State<_ScanOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animCtrl;
+  late final Animation<double> _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _animCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    )..repeat(reverse: true);
+    _anim = CurvedAnimation(parent: _animCtrl, curve: Curves.easeInOut);
+  }
+
+  @override
+  void dispose() {
+    _animCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: AnimatedBuilder(
+        animation: _anim,
+        builder: (context, child) {
+          final alpha = (_anim.value * 255).round();
+          final color = Colors.white.withAlpha(alpha.clamp(60, 180));
+          return CustomPaint(
+            size: const Size(220, 220),
+            painter: _ScanFramePainter(color),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Paints animated corner brackets for the scanning frame.
+class _ScanFramePainter(this.color) extends CustomPainter {
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 2.5
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    const cornerLen = 28.0;
+    final w = size.width;
+    final h = size.height;
+
+    canvas.drawLine(const Offset(0, cornerLen), Offset.zero, paint);
+    canvas.drawLine(const Offset(cornerLen, 0), Offset.zero, paint);
+
+    canvas.drawLine(Offset(w - cornerLen, 0), Offset(w, 0), paint);
+    canvas.drawLine(Offset(w, cornerLen), Offset(w, 0), paint);
+
+    canvas.drawLine(Offset(0, h - cornerLen), Offset(0, h), paint);
+    canvas.drawLine(Offset(cornerLen, h), Offset(0, h), paint);
+
+    canvas.drawLine(Offset(w - cornerLen, h), Offset(w, h), paint);
+    canvas.drawLine(Offset(w, h - cornerLen), Offset(w, h), paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ScanFramePainter oldDelegate) =>
+      color != oldDelegate.color;
+}
+
+/// Animated clipboard button with press animation and long-press paste/copy toggle.
+class const _ClipboardToggleButton({
+  required this.isPasteMode,
+  required this.isActive,
+  required this.onTap,
+  required this.onLongPress,
+}) extends StatefulWidget {
+  final bool isPasteMode;
+  final bool isActive;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  @override
+  State<_ClipboardToggleButton> createState() => _ClipboardToggleButtonState();
+}
+
+class _ClipboardToggleButtonState() extends State<_ClipboardToggleButton> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onLongPress: widget.isActive ? null : widget.onLongPress,
+      onTapDown: widget.isActive
+          ? null
+          : (_) => setState(() => _pressed = true),
+      onTapUp: widget.isActive ? null : (_) => setState(() => _pressed = false),
+      onTapCancel: () => setState(() => _pressed = false),
+      onTap: widget.isActive
+          ? null
+          : () {
+              widget.onTap();
+              setState(() => _pressed = false);
+            },
+      child: AnimatedScale(
+        scale: _pressed ? 0.75 : 1.0,
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeInOut,
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          transitionBuilder: (child, anim) =>
+              ScaleTransition(scale: anim, child: child),
+          child: Icon(
+            key: ValueKey(widget.isPasteMode),
+            widget.isPasteMode ? Icons.content_paste : Icons.content_copy,
+            size: 20,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+enum ReceivePhase() {
+  idle,
+  pending,
+  receiving,
+  completed,
+  failed,
+  cancelled,
+}

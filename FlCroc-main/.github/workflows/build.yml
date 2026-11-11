@@ -1,0 +1,771 @@
+name: Build
+
+# 可复用构建工作流（on: workflow_call）—— 所有目标的编译 + 打包的唯一实现处。
+#
+# 调用方是 release.yml（唯一入口）：它负责算版本号、串起 i18n/文档的重新生成与回写
+# （update_i18n.yml）、创建 Release；本文件只负责把包做出来。构建目标完全由调用方
+# 传入的布尔输入决定。
+#
+# 原先基于提交信息文本（b-all / b-win / b-linux / b-mobile / arch-all）的平台探测
+# 已全部移除 —— 与 Suwayomi-next 一致，入口只认 workflow_dispatch 选项，
+# 以及 release.yml 里「push main ⇒ 默认三目标」那一条自动路径。
+#
+# 版本号经 inputs.version 传入（完整版本，含 build 号，如 1.2.4+90），每个 job 在
+# checkout 后用 sed 写进 pubspec.yaml 再编译。刻意**不**依赖调用方上传的 pubspec
+# 制品，所以本工作流与调用方的 i18n/文档回写之间没有制品耦合、可以并行。
+#
+# 产物统一命名 FlCroc-<x.y.z>-<os>-<arch>.<ext>，架构用 x64 / arm64（不用 amd64：
+# 那是 Go 的 GOARCH 写法，只出现在 go build 的参数里，不进产物名）。
+#
+# 工具链版本集中在下面 env:（GO_VERSION / FLUTTER_VERSION），各 job 共用。Flutter
+# 钉到具体版本号而不是 channel: stable —— 同一个 commit 重复构建会拿到同一个 SDK。
+# 调用方 release.yml 顶部另有一份 FLUTTER_VERSION（README 徽章/表格印的就是它），
+# 改一处要同步改另一处。
+#
+# Linux 两个 job 的宿主是 ubuntu-24.04，编译发生在 container: ubuntu:22.04 内 ——
+# 产物引用的 glibc 符号版本由容器里那套 libc 决定，宿主换代不动它。容器内的硬约束：
+# 默认 shell 是 sh（本文件显式声明 shell: bash）；裸 ubuntu 镜像既没有 git 也没有
+# gcc（故 checkout 之前先装 git、构建之前装 build-essential）；容器内没有 sudo，
+# 直接调 apt-get；容器以 root 运行，而挂进来的工作区与工具缓存都属 runner 用户，
+# 会被 git 的 dubious-ownership 检查拦下（故 checkout 前 `git config --system --add
+# safe.directory '*'`，详见 build-linux 的 Install git 步骤）；subosito/flutter-action
+# 的 setup.sh 靠 jq 解析版本清单，裸镜像里没有。两个 Linux job 末尾都用 readelf
+# 断言产物的 glibc 门槛。
+#
+# macOS 只有 arm64 一个目标。
+#
+# action 版本都已升到当前最新大版本，全部跑在 Node 24 运行时上（要求 runner
+# ≥ 2.327.1；GitHub 托管 runner 恒满足，自托管需先升级）。升级时核过的破坏性变更：
+#   checkout v7        —— v5 起换 Node 24；v7 起禁止 pull_request_target/workflow_run
+#                         checkout fork PR（我们不用这两个触发，无影响）
+#   setup-go v7        —— v6 换 Node 24，v7 转 ESM
+#   setup-java v6      —— v5 换 Node 24；v6 把 Zulu 的 Discovery API 换成 Azul
+#                         Metadata API（只影响 distribution: zulu，我们用 temurin）
+#   upload-artifact v7 —— v5/v6 换 Node 24；v7 新增可选的 archive 参数（默认仍打包）
+# 我们的 with: 参数（name / path / if-no-files-found / go-version / distribution）
+# 都未落在上述破坏性变更里。
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 完整版本号（含 build 号，如 1.2.4+90），编译前写进 pubspec.yaml
+        required: true
+        type: string
+      windows_x64:
+        required: false
+        type: boolean
+        default: false
+      windows_arm64:
+        description: Windows ARM64；x64 基底包由本工作流的 windows job 内部构建，调用方无需同时打开 windows_x64
+        required: false
+        type: boolean
+        default: false
+      linux_x64:
+        required: false
+        type: boolean
+        default: false
+      linux_arm64:
+        description: Linux ARM64；在原生 arm64 runner 上构建
+        required: false
+        type: boolean
+        default: false
+      android_arm64:
+        required: false
+        type: boolean
+        default: false
+      android_x64:
+        required: false
+        type: boolean
+        default: false
+      macos_arm64:
+        description: macOS ARM64；Flutter 已停止支持 Intel macOS，故只有 arm64
+        required: false
+        type: boolean
+        default: false
+
+# 工具链版本在这里钉死。release.yml 另有一份同名 env，改一处要同步改另一处。
+env:
+  GO_VERSION: '1.27.1'
+  FLUTTER_VERSION: '3.47.5'
+
+jobs:
+  # ── Windows ──
+  build-windows:
+    name: Windows
+    if: inputs.windows_x64 || inputs.windows_arm64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # shell: bash 覆盖掉 job 默认的 pwsh —— 1) sed 一行搞定版本替换；2) Windows
+      # PowerShell 5.1 的 Set-Content 默认写 UTF-16LE，会把 pubspec.yaml 写坏。
+      - name: Apply version
+        shell: bash
+        run: |
+          sed -i "s/^version: .*/version: ${{ inputs.version }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "display_version=${VERSION%%+*}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      # ════════════════════════════════════════════════════════════
+      # ── x64：原生 Go 构建 + Flutter Windows ──
+      # 这些步骤的 if 是「要 x64 或要 arm64」：arm64 包 = 拿 x64 包换 .dll 重打，
+      # 所以只要 arm64 也得先构建出 x64 基底。**但上传只认 windows_x64** ——
+      # 用户没勾 x64 时它只是 job 内部的中间产物，不进产物列表也不进发布。
+      # ════════════════════════════════════════════════════════════
+
+      - name: "[x64] Build Go bridge (.dll)"
+        if: inputs.windows_x64 || inputs.windows_arm64
+        run: |
+          Push-Location go_bridge
+          go mod tidy
+          $env:CGO_ENABLED = "1"
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CC = "gcc"
+          go build -buildmode=c-shared -ldflags="-s -w -H windowsgui -extldflags=-Wl,--subsystem,windows" -o "$env:GITHUB_WORKSPACE\windows\runner\libcroc_bridge.dll" .
+          Pop-Location
+
+      - name: "[x64] Verify .dll"
+        if: inputs.windows_x64 || inputs.windows_arm64
+        run: |
+          if (Test-Path windows\runner\libcroc_bridge.dll) {
+            Get-Item windows\runner\libcroc_bridge.dll | Select-Object Length, FullName
+          } else {
+            Write-Error "libcroc_bridge.dll not found!"
+            exit 1
+          }
+
+      - name: "[x64] Build Flutter Windows"
+        if: inputs.windows_x64 || inputs.windows_arm64
+        run: flutter build windows --release
+
+      - name: "[x64] Bundle bridge .dll into build output"
+        if: inputs.windows_x64 || inputs.windows_arm64
+        run: Copy-Item "windows\runner\libcroc_bridge.dll" "build\windows\x64\runner\Release\libcroc_bridge.dll" -Force
+
+      - name: "[x64] Package zip"
+        if: inputs.windows_x64 || inputs.windows_arm64
+        run: Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath FlCroc-${{ steps.ver.outputs.display_version }}-windows-x64.zip
+
+      # 只有用户真的勾了 windows_x64 才把这个 zip 当成产物上传。
+      - uses: actions/upload-artifact@v7
+        if: inputs.windows_x64
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-windows-x64
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-windows-x64.zip
+
+      # ════════════════════════════════════════════════════════════
+      # ── ARM64：Zig 交叉编译 Go bridge → 用上面的 x64 zip 重打 ──
+      # 直接读上一步在同一个 runner 上落地的 zip，不再 download-artifact：
+      # 那样要求 x64 包必须先上传，而没勾 x64 时它不该被上传。
+      # ════════════════════════════════════════════════════════════
+
+      - name: "[ARM64] Setup Zig (cross-compiler)"
+        if: inputs.windows_arm64
+        run: |
+          if (!(Get-Command zig -ErrorAction SilentlyContinue)) {
+            choco install zig --no-progress -y
+          }
+          zig version
+
+      - name: "[ARM64] Build Go bridge (.dll)"
+        if: inputs.windows_arm64
+        run: |
+          Push-Location go_bridge
+          go mod tidy
+          $env:CGO_ENABLED = "1"
+          $env:GOOS = "windows"
+          $env:GOARCH = "arm64"
+          $env:CC = "zig cc -target aarch64-windows-gnu"
+          $env:CXX = "zig c++ -target aarch64-windows-gnu"
+          go build -buildmode=c-shared -ldflags="-s -w -H windowsgui -extldflags=-Wl,--subsystem,windows" -o "$env:GITHUB_WORKSPACE\windows\runner\libcroc_bridge_arm64.dll" .
+          Pop-Location
+
+      - name: "[ARM64] Verify .dll"
+        if: inputs.windows_arm64
+        run: |
+          if (Test-Path windows\runner\libcroc_bridge_arm64.dll) {
+            Get-Item windows\runner\libcroc_bridge_arm64.dll | Select-Object Length, FullName
+          } else {
+            Write-Error "libcroc_bridge_arm64.dll not found!"
+            exit 1
+          }
+
+      - name: "[ARM64] Repack with ARM64 .dll"
+        if: inputs.windows_arm64
+        run: |
+          $base = "FlCroc-${{ steps.ver.outputs.display_version }}-windows-x64.zip"
+          if (!(Test-Path $base)) {
+            Write-Error "x64 基底包不存在：$base（[x64] 构建步骤被跳过？）"
+            exit 1
+          }
+          Expand-Archive $base -DestinationPath arm64-repack
+          Copy-Item "windows\runner\libcroc_bridge_arm64.dll" "arm64-repack\libcroc_bridge.dll" -Force
+          Copy-Item "windows\runner\libcroc_bridge_arm64.dll" "arm64-repack\data\flutter_assets\libcroc_bridge.dll" -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "arm64-repack\*" -DestinationPath FlCroc-${{ steps.ver.outputs.display_version }}-windows-arm64.zip
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.windows_arm64
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-windows-arm64
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-windows-arm64.zip
+
+  # ── Linux x64 ──
+  build-linux:
+    name: Linux x64
+    if: inputs.linux_x64
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    # 容器 job 的默认 shell 是 sh，而下面的脚本用了 pipefail、${VAR%%+*} 之类 bash 语法。
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # 裸 ubuntu 镜像里没有 git，而 checkout 就需要它。steps 按序执行、容器在任何
+      # step 之前就已启动，所以这是唯一能在 checkout 之前补依赖的位置。
+      - name: Install git (base image has none)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git ca-certificates
+          # 容器以 root 运行，而 /__w 是从宿主 /home/runner/work 挂进来的 bind mount，
+          # 属主是 runner 用户。git 2.34.1 带 dubious-ownership 检查（CVE-2022-24765
+          # 的 backport），root 操作别人拥有的仓库会直接 exit 128。
+          # actions/checkout 自己那份 safe.directory 写在**临时 HOME** 里，出了它那一步
+          # 就没了 —— 于是第一个被绊倒的是 `go build` 的 VCS stamping，报
+          # 「error obtaining VCS status: exit status 128」，且看不到 git 的原始错误。
+          # 用 --system 落到 /etc/gitconfig：不依赖 HOME，容器内后续所有 step 都有效。
+          #
+          # 但只加 ${GITHUB_WORKSPACE} 不够。这个 job 还要碰 runner 工具缓存里的
+          # Flutter SDK（宿主 /opt/hostedtoolcache，容器里 bind 挂成 /__t），SDK 自身
+          # 就是个 git 仓库，flutter_tools 会读它的版本，于是 `flutter pub get` 报：
+          #   fatal: detected dubious ownership in repository at
+          #   '/__t/flutter/stable-3.47.5-x64/flutter'
+          # safe.directory 是**精确匹配**（git 文档另有 `/dir/*` 的前缀写法，但容器里这
+          # 套 2.34.1 的 CVE backport 只认精确路径与 `*` 两种），而 /__t 下的路径带
+          # Flutter 版本号、会随 SDK 升级变化，写死迟早失效 —— 所以直接整体放开：容器
+          # 是一次性的，里面只有本仓库与官方 SDK，没有不可信的第三方仓库，放开的代价为零。
+          git config --system --add safe.directory '*'
+          git config --system --get-all safe.directory
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # 把上面的推断当场验证掉：safe.directory 一旦失效就在这里失败，而不是等到
+      # go build 抛一句难查的 exit status 128。
+      - name: Assert git can operate on the repo
+        run: |
+          git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD
+          git -C "$GITHUB_WORKSPACE" status --porcelain >/dev/null
+          echo "✓ 容器内 git 可正常操作仓库"
+
+      - name: Apply version
+        run: |
+          sed -i "s/^version: .*/version: ${{ inputs.version }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Resolve version
+        id: ver
+        run: echo "display_version=${VERSION%%+*}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # 容器里没有 sudo，也没有 runner 镜像那套预装工具，所以这一串比在托管 runner 上
+      # 裸跑时要长：build-essential 提供 Go bridge 的 CGO 需要的 gcc 与 Flutter Linux
+      # 侧 C++ 需要的 libstdc++ 头；curl / unzip / xz-utils 是 Flutter 工具自己下载并
+      # 解包 engine 与 Dart SDK 用的；file 与 binutils 供下面的产物校验用。
+      # jq 是 subosito/flutter-action 的 setup.sh 解析版本清单用的 —— 托管 runner 镜像
+      # 自带，裸 ubuntu 镜像没有，缺了会直接报 "jq not found" 并让这一步失败。
+      # （build-linux-arm64 不需要 jq：它不走这个 action，改为手工 clone Flutter SDK。）
+      - name: Install Linux deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev \
+            liblzma-dev build-essential curl unzip xz-utils file binutils jq
+
+      - name: Build Go bridge (.so)
+        run: |
+          cd go_bridge
+          go mod tidy
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -buildmode=c-shared -ldflags="-s -w" -o ../linux/flutter/ephemeral/libcroc_bridge.so .
+          cd ..
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # 与上面的 Assert 同一目的：把「safe.directory 没覆盖到 SDK」这类问题在 pub get
+      # 之前就点出来，否则只能看到一句 exit code 128（flutter_tools 会把 git 的 stderr
+      # 吞掉，看不到 fatal: 原文）。路径从 PATH 反推，不依赖这个 action 是否导出
+      # FLUTTER_ROOT。arm64 job 不需要这一步：它的 SDK 是容器内 root 自己 clone 的，
+      # 属主与执行者一致，压根不会触发 dubious ownership。
+      - name: Assert git can operate on the Flutter SDK
+        run: |
+          SDK=$(cd "$(dirname "$(command -v flutter)")/.." && pwd)
+          echo "Flutter SDK = $SDK"
+          git -C "$SDK" rev-parse --short HEAD
+          echo "✓ git 可操作 Flutter SDK"
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      # --target-platform 在 x64 主机上本就默认 linux-x64，显式写出是为了与 arm64
+      # job 对称：一旦这批跑在非 x64 主机上，flutter 会直接报「不支持交叉编译」，
+      # 而不是静默产出错架构的包。
+      - name: Build Linux x64
+        run: flutter build linux --release --target-platform linux-x64
+
+      - name: Bundle bridge .so & verify arch
+        run: |
+          set -euo pipefail
+          BUNDLE=build/linux/x64/release/bundle
+          [ -d "$BUNDLE" ] || { echo "::error::$BUNDLE 不存在（构建目录变了？）"; exit 1; }
+          mkdir -p "$BUNDLE/lib"
+          cp linux/flutter/ephemeral/libcroc_bridge.so "$BUNDLE/lib/"
+          file "$BUNDLE/fl_croc" "$BUNDLE/lib/libcroc_bridge.so"
+          # 只判 ELF magic 拦不住交叉生成，必须按架构断言；不用管道 + grep -q
+          # （`set -o pipefail` 下 grep -q 会让上游吃 SIGPIPE，rc=141 误判失败）
+          APP_INFO=$(file -b "$BUNDLE/fl_croc")
+          case "$APP_INFO" in
+            *x86-64*) echo "✓ 产物架构正确" ;;
+            *) echo "::error::产物不是 x86-64：$APP_INFO"; exit 1 ;;
+          esac
+
+      # 产物的 glibc 门槛由 container 里那套 libc 决定。阈值写死，容器一旦被摘掉就
+      # 直接失败，而不是把门槛悄悄抬上去 —— 抬高后的表现是用户侧 `GLIBC_2.3x not found`，
+      # 在 CI 里完全看不出来。只统计 GLIBC_*，不含 GLIBCXX_*（libstdc++ 是另一套版本线）。
+      - name: Assert glibc floor
+        run: |
+          set -euo pipefail
+          BUNDLE=build/linux/x64/release/bundle
+          MAX=$(readelf --version-info "$BUNDLE/fl_croc" "$BUNDLE/lib/libcroc_bridge.so" \
+                  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "产物引用的最高 glibc 符号版本：$MAX"
+          case "$MAX" in
+            GLIBC_2.34|GLIBC_2.3[0-3]|GLIBC_2.2[0-9]) echo "✓ 未超过 GLIBC_2.34" ;;
+            *) echo "::error::glibc 门槛被抬高到 $MAX"; exit 1 ;;
+          esac
+
+      - name: Package tar
+        run: tar -czf FlCroc-${{ steps.ver.outputs.display_version }}-linux-x64.tar.gz -C build/linux/x64/release/bundle .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-linux-x64
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-linux-x64.tar.gz
+
+  # ── Linux ARM64 ──
+  # 必须跑在**原生 arm64** 主机上：flutter_tools 明确禁止 x64 → arm64 交叉编译 ——
+  #   if (hostPlatform == linux_x64 && targetPlatform == linux_arm64)
+  #     throwToolExit('Cross-build from Linux x64 host to Linux arm64 target is not
+  #     currently supported.');            // commands/build_linux.dart
+  # 在 arm64 主机上 HostPlatform.linux_arm64.platformName 与
+  # TargetPlatform.linux_arm64.simpleName 都是 'arm64'（base/os.dart、build_info.dart），
+  # needCrossBuild 为 false，走的是受支持的原生路径。
+  #
+  # 因此这里**不能**用 subosito/flutter-action：官方 releases_linux.json 里
+  # dart_sdk_arch 只有 x64，linux/macos/windows 三个平台中只有 macOS 带 arm64 归档，
+  # 在 arm64 主机上装 x64 SDK 会立刻失败。可行路径是 clone 官方仓库、由 bin/flutter
+  # 自行拉取 flutter_infra_release/flutter/<engine>/ 下的
+  # dart-sdk-linux-arm64.zip 与 linux-arm64{,-release}/（两者都已确认存在）。
+  build-linux-arm64:
+    name: Linux ARM64
+    if: inputs.linux_arm64
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      # 装在工作区内（点开头，不会被工具扫到）。不用 runner.temp：`runner` 上下文
+      # 在 job 级 env: 里不可用（只有 github / needs / strategy / matrix / vars /
+      # secrets / inputs 可用），写 ${{ runner.temp }} 会解析成空串。
+      FLUTTER_SDK: ${{ github.workspace }}/.flutter-sdk
+    steps:
+      # 同 build-linux：裸 ubuntu 镜像没有 git，而 checkout 就需要它。
+      # safe.directory 的理由与取值见 build-linux 的 Install git 步骤 —— 同样是容器以
+      # root 操作 runner 用户拥有的 bind mount，不设就会让 go build 的 VCS stamping
+      # 挂掉。这里同样用 '*'：Flutter SDK 是 clone 到工作区**子目录** .flutter-sdk 的，
+      # 精确匹配的 safe.directory 覆盖不到它。
+      - name: Install git (base image has none)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git ca-certificates
+          git config --system --add safe.directory '*'
+          git config --system --get-all safe.directory
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Assert git can operate on the repo
+        run: |
+          git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD
+          git -C "$GITHUB_WORKSPACE" status --porcelain >/dev/null
+          echo "✓ 容器内 git 可正常操作仓库"
+
+      - name: Apply version
+        run: |
+          sed -i "s/^version: .*/version: ${{ inputs.version }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Resolve version
+        id: ver
+        run: echo "display_version=${VERSION%%+*}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # 与 build-linux 同一串依赖（原因见那里的注释）；arm64 容器同样是裸 ubuntu 镜像。
+      - name: Install Linux deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq clang cmake ninja-build pkg-config libgtk-3-dev \
+            liblzma-dev build-essential curl unzip xz-utils file binutils
+
+      - name: Setup Flutter (native arm64, from git)
+        run: |
+          set -euo pipefail
+          # 版本与其它 job 同源（env.FLUTTER_VERSION），只是这里必须自己 clone：
+          # 官方 releases_linux.json 的 Linux 归档只有 x64，arm64 主机装不上。
+          # 浅 clone 到具体 tag（而不是 -b stable 分支）：git describe 只有能就地看到
+          # 该 tag 才认得出框架版本号，否则 flutter --version 会报 0.0.0-unknown。
+          echo "Flutter = $FLUTTER_VERSION"
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$FLUTTER_SDK"
+          echo "$FLUTTER_SDK/bin" >> "$GITHUB_PATH"
+
+      - name: Verify SDK is really aarch64
+        run: |
+          set -euo pipefail
+          flutter --version
+          # 刻意**不**写 `file ... | grep -q aarch64`：`set -o pipefail` 下 grep -q
+          # 一命中就退出，上游可能吃到 SIGPIPE（rc=141）从而把整步判失败。先取值再
+          # case 匹配，整条链路没有管道。
+          DART_INFO=$(file -b "$FLUTTER_SDK/bin/cache/dart-sdk/bin/dart")
+          echo "dart-sdk: $DART_INFO"
+          case "$DART_INFO" in
+            *aarch64*) echo "✓ Dart SDK 是 aarch64 原生二进制" ;;
+            *) echo "::error::拉到的 Dart SDK 不是 aarch64：$DART_INFO"; exit 1 ;;
+          esac
+
+      - name: Build Go bridge (.so)
+        run: |
+          cd go_bridge
+          go mod tidy
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+            go build -buildmode=c-shared -ldflags="-s -w" -o ../linux/flutter/ephemeral/libcroc_bridge.so .
+          cd ..
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build Linux ARM64
+        run: flutter build linux --release --target-platform linux-arm64
+
+      - name: Bundle bridge .so & verify arch
+        run: |
+          set -euo pipefail
+          # 输出目录由 TargetPlatform.simpleName 决定 → build/linux/arm64/release/bundle
+          BUNDLE=build/linux/arm64/release/bundle
+          [ -d "$BUNDLE" ] || { echo "::error::$BUNDLE 不存在（构建目录变了？）"; exit 1; }
+          mkdir -p "$BUNDLE/lib"
+          cp linux/flutter/ephemeral/libcroc_bridge.so "$BUNDLE/lib/"
+          file "$BUNDLE/fl_croc" "$BUNDLE/lib/libcroc_bridge.so"
+          # 只判 ELF magic 拦不住交叉生成，必须按架构断言；不用管道 + grep -q（见上）
+          APP_INFO=$(file -b "$BUNDLE/fl_croc")
+          case "$APP_INFO" in
+            *aarch64*) echo "✓ 产物架构正确" ;;
+            *) echo "::error::产物不是 aarch64：$APP_INFO"; exit 1 ;;
+          esac
+
+      # 同 build-linux 的 glibc 门槛断言（阈值与理由见那里的注释）。
+      - name: Assert glibc floor
+        run: |
+          set -euo pipefail
+          BUNDLE=build/linux/arm64/release/bundle
+          MAX=$(readelf --version-info "$BUNDLE/fl_croc" "$BUNDLE/lib/libcroc_bridge.so" \
+                  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+          echo "产物引用的最高 glibc 符号版本：$MAX"
+          case "$MAX" in
+            GLIBC_2.34|GLIBC_2.3[0-3]|GLIBC_2.2[0-9]) echo "✓ 未超过 GLIBC_2.34" ;;
+            *) echo "::error::glibc 门槛被抬高到 $MAX"; exit 1 ;;
+          esac
+
+      - name: Package tar
+        run: tar -czf FlCroc-${{ steps.ver.outputs.display_version }}-linux-arm64.tar.gz -C build/linux/arm64/release/bundle .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-linux-arm64
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-linux-arm64.tar.gz
+
+  # ── Android（arm64 / x64 各自独立，按选项出） ──
+  build-android:
+    name: Android
+    if: inputs.android_arm64 || inputs.android_x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Apply version
+        run: |
+          sed -i "s/^version: .*/version: ${{ inputs.version }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Resolve version
+        id: ver
+        run: echo "display_version=${VERSION%%+*}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Build Go bridge
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cd go_bridge
+          go mod tidy
+          export HOST_TAG=linux-x86_64
+
+          if [ "${{ inputs.android_arm64 }}" = "true" ]; then
+            mkdir -p ../android/app/src/main/jniLibs/arm64-v8a
+            export CC="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/aarch64-linux-android21-clang"
+            CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+              go build -buildmode=c-shared -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" \
+              -o ../android/app/src/main/jniLibs/arm64-v8a/libcroc_bridge.so .
+            echo "✓ Go bridge built for Android ARM64"
+            file ../android/app/src/main/jniLibs/arm64-v8a/libcroc_bridge.so
+          fi
+
+          if [ "${{ inputs.android_x64 }}" = "true" ]; then
+            mkdir -p ../android/app/src/main/jniLibs/x86_64
+            export CC="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/x86_64-linux-android21-clang"
+            CGO_ENABLED=1 GOOS=android GOARCH=amd64 \
+              go build -buildmode=c-shared -ldflags="-s -w -extldflags=-Wl,-z,max-page-size=16384" \
+              -o ../android/app/src/main/jniLibs/x86_64/libcroc_bridge.so .
+            echo "✓ Go bridge built for Android x64"
+            file ../android/app/src/main/jniLibs/x86_64/libcroc_bridge.so
+          fi
+          cd ..
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Patch Android plugin registrant
+        run: |
+          FILE=android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+          sed -i 's/catch (Exception e)/catch (Throwable e)/g' "$FILE"
+          rm -rf android/app/src/main/kotlin/com
+
+      - name: Build Android ARM64
+        if: inputs.android_arm64
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Save ARM64 APK
+        if: inputs.android_arm64
+        run: cp build/app/outputs/flutter-apk/app-release.apk FlCroc-${{ steps.ver.outputs.display_version }}-android-arm64.apk
+
+      - name: Build Android x64
+        if: inputs.android_x64
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: flutter build apk --release --target-platform android-x64
+
+      - name: Save x64 APK
+        if: inputs.android_x64
+        run: cp build/app/outputs/flutter-apk/app-release.apk FlCroc-${{ steps.ver.outputs.display_version }}-android-x64.apk
+
+      # 用通配而不是逐行列两个路径：只勾一个架构时另一个文件不存在，列路径会让
+      # upload-artifact 直接报错（旧写法只能靠 continue-on-error 兜着）。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-android
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-android-*.apk
+          if-no-files-found: error
+
+  # ── macOS ARM64 ──
+  # macos-latest 目前是 macOS 26 arm64。不写死 macos-26 是为了跟着 GitHub 的
+  # -latest 迁移走，代价是架构要自己兜底 —— 下面用 lipo 断言 app 与 dylib 都是
+  # arm64，标签若指向 Intel 镜像就直接失败，不会静默产出错架构的包。
+  #
+  # macOS runner 自带 Xcode / clang / CocoaPods，无需额外装工具链。
+  # macos/Podfile 不入库：flutter build macos 会用 SDK 里的 Podfile-macos 模板自动
+  # 生成（见 flutter_tools 的 CocoaPods.setupPodfile），Podfile.lock 与 Pods/ 也在
+  # macos/.gitignore 里。
+  build-macos:
+    name: macOS ARM64
+    if: inputs.macos_arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      # BSD sed 的 -i 必须显式带备份后缀，写成 -i.bak 再删掉，GNU / BSD 同形。
+      - name: Apply version
+        run: |
+          sed -i.bak "s/^version: .*/version: ${{ inputs.version }}/" pubspec.yaml
+          rm -f pubspec.yaml.bak
+          grep '^version:' pubspec.yaml
+
+      - name: Resolve version
+        id: ver
+        run: echo "display_version=${VERSION%%+*}" >> $GITHUB_OUTPUT
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build Go bridge (.dylib)
+        run: |
+          cd go_bridge
+          go mod tidy
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -buildmode=c-shared -ldflags="-s -w" -o ../macos/Runner/libcroc_bridge.dylib .
+          cd ..
+
+      - name: Build macOS ARM64
+        run: flutter build macos --release
+
+      - name: Bundle bridge .dylib, verify arch & re-sign
+        run: |
+          set -euo pipefail
+          APP="build/macos/Build/Products/Release/fl_croc.app"
+          [ -d "$APP" ] || { echo "::error::$APP 不存在（构建目录变了？）"; exit 1; }
+          # Contents/Frameworks 是 pbxproj 里 rpath（@executable_path/../Frameworks）的
+          # 落点，也是 codesign 认可的嵌套代码位置。Dart 侧搜索顺序见
+          # lib/core/lib_native.dart。
+          cp macos/Runner/libcroc_bridge.dylib "$APP/Contents/Frameworks/"
+          # 动过 .app 内容后原签名就失效了，必须重签：先签新加的 dylib，再重签整个
+          # bundle（重签会一并重算 _CodeSignature/CodeResources 封条）。没有开发者
+          # 证书，用 ad-hoc（`-`）。--entitlements 必须显式带上 —— 不带的话重签会把
+          # 工程里配好的沙盒与网络权限整份丢掉。
+          codesign --force --sign - "$APP/Contents/Frameworks/libcroc_bridge.dylib"
+          codesign --force --sign - --entitlements macos/Runner/Release.entitlements "$APP"
+          codesign --verify --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP"
+          APP_ARCHS=$(lipo -archs "$APP/Contents/MacOS/fl_croc")
+          LIB_ARCHS=$(lipo -archs "$APP/Contents/Frameworks/libcroc_bridge.dylib")
+          echo "fl_croc: $APP_ARCHS"
+          echo "libcroc_bridge.dylib: $LIB_ARCHS"
+          [ "$APP_ARCHS" = "arm64" ] || { echo "::error::产物不是 arm64：$APP_ARCHS"; exit 1; }
+          [ "$LIB_ARCHS" = "arm64" ] || { echo "::error::dylib 不是 arm64：$LIB_ARCHS"; exit 1; }
+
+      # 用 ditto 而不是 zip：只有它能把 .app 里的符号链接、扩展属性与权限原样写进
+      # 归档；`zip -r` 会把 framework 内部的 symlink 展平，解出来的包结构是坏的。
+      - name: Package zip
+        run: |
+          set -euo pipefail
+          ZIP="FlCroc-${{ steps.ver.outputs.display_version }}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/macos/Build/Products/Release/fl_croc.app" "$ZIP"
+          ls -lh "$ZIP"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FlCroc-${{ steps.ver.outputs.display_version }}-macos-arm64
+          path: FlCroc-${{ steps.ver.outputs.display_version }}-macos-arm64.zip

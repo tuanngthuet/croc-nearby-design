@@ -1,0 +1,115 @@
+import 'package:fl_croc/common/common.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/rendering.dart';
+
+class const CommonScaffold({
+  super.key,
+  this.title,
+  this.actions,
+  required this.body,
+  this.floatingActionButton,
+  this.bottomNavigationBar,
+  this.resizeToAvoidBottomInset = true,
+  this.backgroundColor,
+  this.appBar,
+}) extends StatefulWidget {
+  final String? title;
+  final List<Widget>? actions;
+  final Widget body;
+  final Widget? floatingActionButton;
+  final Widget? bottomNavigationBar;
+  final bool resizeToAvoidBottomInset;
+  final Color? backgroundColor;
+  final PreferredSizeWidget? appBar;
+
+  @override
+  State<CommonScaffold> createState() => CommonScaffoldState();
+}
+
+class CommonScaffoldState() extends State<CommonScaffold> {
+  final _isFabExtendedNotifier = ValueNotifier<bool>(true);
+
+  PreferredSizeWidget _buildDefaultAppBar() {
+    return AppBar(
+      title: widget.title != null ? Text(widget.title!) : null,
+      actions: widget.actions,
+      backgroundColor: context.colorScheme.surface,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      scrolledUnderElevation: 0,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final appBar = widget.appBar ?? _buildDefaultAppBar();
+
+    return Scaffold(
+      appBar: appBar,
+      body: NotificationListener<UserScrollNotification>(
+        child: widget.body,
+        onNotification: (notification) {
+          if (notification.direction == ScrollDirection.reverse) {
+            _isFabExtendedNotifier.value = false;
+          } else if (notification.direction == ScrollDirection.forward) {
+            _isFabExtendedNotifier.value = true;
+          }
+          return false;
+        },
+      ),
+      resizeToAvoidBottomInset: widget.resizeToAvoidBottomInset,
+      backgroundColor: widget.backgroundColor,
+      floatingActionButton: widget.floatingActionButton != null
+          ? ValueListenableBuilder<bool>(
+              valueListenable: _isFabExtendedNotifier,
+              builder: (_, isExtended, child) {
+                return AnimatedScale(
+                  scale: isExtended ? 1.0 : 0.0,
+                  duration: commonDuration,
+                  child: child,
+                );
+              },
+              child: widget.floatingActionButton,
+            )
+          : null,
+      bottomNavigationBar: widget.bottomNavigationBar,
+    );
+  }
+}
+
+class const BaseScaffold({
+  super.key,
+  required this.title,
+  this.actions = const [],
+  required this.body,
+}) extends StatelessWidget {
+  final String title;
+  final List<Widget> actions;
+  final Widget body;
+
+  @override
+  Widget build(BuildContext context) {
+    return CommonScaffold(body: body, title: title, actions: actions);
+  }
+}
+
+class const CommonScaffoldFabExtendedProvider({
+  super.key,
+  required this.isExtended,
+  required super.child,
+}) extends InheritedWidget {
+  final bool isExtended;
+
+  @override
+  bool updateShouldNotify(CommonScaffoldFabExtendedProvider oldWidget) {
+    return isExtended != oldWidget.isExtended;
+  }
+
+  static bool of(BuildContext context) {
+    final widget = context
+        .dependOnInheritedWidgetOfExactType<
+          CommonScaffoldFabExtendedProvider
+        >();
+    return widget?.isExtended ?? true;
+  }
+}

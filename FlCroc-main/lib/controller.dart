@@ -1,0 +1,84 @@
+import 'dart:async';
+
+import 'package:fl_croc/core/controller.dart';
+import 'package:fl_croc/enum/enum.dart';
+import 'package:fl_croc/models/models.dart';
+import 'package:fl_croc/providers/providers.dart';
+import 'package:fl_croc/state.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class AppController._internal() {
+  late final WidgetRef _ref;
+  bool isAttach = false;
+
+  static AppController? _instance;
+
+  factory AppController() {
+    _instance ??= AppController._internal();
+    return _instance!;
+  }
+
+  Future<void> attach(BuildContext context, WidgetRef ref) async {
+    _ref = ref;
+    isAttach = true;
+
+    final ok = await coreController.init();
+    if (ok) {
+      await updateCoreStatus(CoreStatus.connected);
+    } else {
+      await updateCoreStatus(CoreStatus.disconnected);
+    }
+  }
+
+  void detach() {
+    isAttach = false;
+  }
+
+  void toPage(PageLabel label) {
+    _ref.read(appStateProvider.notifier).updatePageLabel(label);
+  }
+
+  Future<void> updateCoreStatus(CoreStatus status) {
+    _ref.read(appStateProvider.notifier).updateCoreStatus(status);
+    return Future.value();
+  }
+
+  void addTransferRecord(TransferRecord record) {
+    _ref.read(appStateProvider.notifier).addTransfer(record);
+  }
+
+  void updateTransferRecord(TransferRecord record) {
+    _ref.read(appStateProvider.notifier).updateTransfer(record);
+  }
+
+  /// Publishes the live transfer speed (bytes/s) for [id].
+  ///
+  /// Passing a value <= 0 removes the entry, which is what terminal states do.
+  void setSpeed(String id, double speed) {
+    _ref.read(appStateProvider.notifier).setSpeed(id, speed);
+  }
+
+  String generateId() {
+    return DateTime.now().millisecondsSinceEpoch.toString();
+  }
+
+  Future<bool> showDisclaimer() async {
+    final result = await globalState.showMessage(
+      text: const TextSpan(
+        text: 'This software is for non-commercial use only.',
+      ),
+    );
+    return result ?? false;
+  }
+
+  void clearHistory() {
+    _ref.read(appStateProvider.notifier).clearTransfers();
+  }
+
+  void navigateTo(PageLabel label) {
+    _ref.read(appStateProvider.notifier).updatePageLabel(label);
+  }
+}
+
+final appController = AppController();
